@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import csv                          # ── NEW ──
+import json                         # ── NEW ──
 import logging
 import math
+import os                           # ── NEW ──
 from collections import defaultdict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict   # ── NEW: asdict ──
+from datetime import datetime               # ── NEW ──
 from pathlib import Path
 
 import torch
@@ -86,6 +90,15 @@ class TrainConfig:
     log_window:     int   = 50                 # rolling window (batches) for tqdm postfix
     run_dir:        str   = "runs/phase1"
 
+    # ━━ NEW: HuggingFace Hub ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # Set push_to_hub=True and provide hf_repo_id to enable auto-upload.
+    # Token priority: hf_token field → HF_TOKEN env var → cached `huggingface-cli login`
+    push_to_hub:    bool  = False              # auto-upload after training finishes
+    hf_repo_id:     str   = ""                # e.g. "username/swara-jepa-phase1"
+    hf_token:       str   = ""                # explicit token (optional)
+    hf_private:     bool  = False             # create as private repo
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Utilities
@@ -140,10 +153,13 @@ class Trainer:
     - All log lines routed through tqdm.write — no bar corruption
     - TensorBoard: per-step scalars + per-epoch train/val averages
       + side-by-side train vs val L1 comparison chart
+    - [NEW] Training history saved to JSON + CSV (training_history_*.csv)
+    - [NEW] Auto-upload to HuggingFace Hub after training (if push_to_hub=True)
 
     Typical lifecycle
     -----------------
-        cfg     = TrainConfig(num_epochs=50)
+        cfg     = TrainConfig(num_epochs=50, push_to_hub=True,
+                              hf_repo_id="myname/swara-jepa")
         trainer = Trainer(cfg)
         trainer.train()
     """
@@ -161,6 +177,18 @@ class Trainer:
 
         self.writer  = SummaryWriter(log_dir=str(self.run_dir / "tb"))
         self._smooth = RunningMean(window=cfg.log_window)
+
+        # ── NEW: training history ─────────────────────────────────────────
+        # Populated during _epoch_loop; persisted via _save_history()
+        self.history: dict = {
+            "metadata": {
+                "started_at": datetime.now().isoformat(timespec="seconds"),
+                "config":     asdict(cfg),
+            },
+            "train": [],   # list of {epoch, L1, L_sigreg, L_jepa, L_canon, ...}
+            "val":   [],   # list of {epoch, L1, L_sigreg, L_jepa, L_canon, ...}
+        }
+        # ─────────────────────────────────────────────────────────────────
 
     # ── Setup helpers ─────────────────────────────────────────────────────
 
@@ -312,6 +340,294 @@ class Trainer:
         self.global_step = ckpt.get("global_step", ckpt.get("step", 0))
         log.info("Resumed → epoch %d  global step %d", self.epoch, self.global_step)
 
+    # ━━ NEW: History persistence ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    def _save_history(self) -> None:
+        """
+        Write self.history to:
+          • training_history.json        — full structured record
+          • training_history_train.csv   — train metrics, one row per epoch
+          • training_history_val.csv     — val   metrics, one row per eval epoch
+        """
+        # ── JSON ──────────────────────────────────────────────────────────
+        json_path = self.run_dir / "training_history.json"
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(self.history, f, indent=2)
+        log.info("History (JSON) → %s", json_path)
+
+        # ── CSV (one file per split) ───────────────────────────────────────
+        for split in ("train", "val"):
+            rows = self.history.get(split, [])
+            if not rows:
+                continue
+            csv_path = self.run_dir / f"training_history_{split}.csv"
+            fieldnames = list(rows[0].keys())
+            with open(csv_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(rows)
+            log.info("History (CSV)  → %s", csv_path)
+
+    # ━━ NEW: Model card ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    def _save_model_card(self) -> None:
+        """
+        Generate a README.md inside run_dir that will serve as the
+        HuggingFace model card.
+        """
+        cfg = self.cfg
+
+        train_rows = self.history.get("train", [])
+        val_rows   = self.history.get("val",   [])
+        final_train = train_rows[-1] if train_rows else {}
+        best_val    = (
+            min(val_rows, key=lambda r: r.get("L1", float("inf")))
+            if val_rows else {}
+        )
+
+        nan = float("nan")
+
+        def fmt(d: dict, key: str) -> str:
+            v = d.get(key, nan)
+            return f"{v:.4f}" if v == v else "—"   # NaN check
+
+        started_at  = self.history["metadata"].get("started_at", "unknown")
+        finished_at = datetime.now().strftime("%Y-%m-%d %H:%M UTC")
+
+        card = f"""\
+---
+tags:
+  - swara-jepa
+  - audio
+  - speech
+  - self-supervised-learning
+  - phase1
+license: apache-2.0
+---
+
+# SwaraJEPA — Phase-1 Pre-trained Model
+
+Pre-trained with the **SwaraJEPA Phase-1** self-supervised objective
+(SIGReg + JEPA block prediction + canonical-form decoder).
+
+| | |
+|---|---|
+| **Started**  | `{started_at}` |
+| **Finished** | `{finished_at}` |
+| **Epochs**   | {cfg.num_epochs} |
+| **Device**   | `{cfg.device}` |
+
+---
+
+## Training Configuration
+
+### Architecture
+
+| Parameter | Value |
+|-----------|-------|
+| `d_model` | {cfg.d_model} |
+| `n_heads` | {cfg.n_heads} |
+| `enc_layers` | {cfg.enc_layers} |
+| `can_dec_layers` | {cfg.can_dec_layers} |
+| `n_vocab_text` | {cfg.n_vocab_text} |
+| `canon_type` | `{cfg.canon_type}` |
+
+### Optimiser
+
+| Parameter | Value |
+|-----------|-------|
+| `batch_size` | {cfg.batch_size} |
+| `lr` | {cfg.lr} |
+| `weight_decay` | {cfg.weight_decay} |
+| `warmup_epochs` | {cfg.warmup_epochs} |
+| `max_grad_norm` | {cfg.max_grad_norm} |
+
+### Loss Weights
+
+| Symbol | Parameter | Value |
+|--------|-----------|-------|
+| λ | `lam` (SIGReg + JEPA block weight) | {cfg.lam} |
+| β | `beta` (SIGReg vs JEPA balance) | {cfg.beta} |
+| ε | `eps` (L_canon weight) | {cfg.eps} |
+| ζ | `zeta` (L_canonlen weight) | {cfg.zeta} |
+| — | `num_slices` (SIGReg directions) | {cfg.num_slices} |
+
+---
+
+## Final Metrics
+
+### Training — last epoch ({final_train.get("epoch", "?")})
+
+| Metric | Value |
+|--------|-------|
+| **L1** | **{fmt(final_train, "L1")}** |
+| L_sigreg | {fmt(final_train, "L_sigreg")} |
+| L_jepa | {fmt(final_train, "L_jepa")} |
+| L_canon | {fmt(final_train, "L_canon")} |
+| L_canonlen | {fmt(final_train, "L_canonlen")} |
+
+### Best Validation (epoch {best_val.get("epoch", "?")})
+
+| Metric | Value |
+|--------|-------|
+| **L1** | **{fmt(best_val, "L1")}** |
+| L_sigreg | {fmt(best_val, "L_sigreg")} |
+| L_jepa | {fmt(best_val, "L_jepa")} |
+| L_canon | {fmt(best_val, "L_canon")} |
+| L_canonlen | {fmt(best_val, "L_canonlen")} |
+
+---
+
+## Repository Contents
+
+| File / Folder | Description |
+|---------------|-------------|
+| `ckpt_final.pt` | Final checkpoint — model weights + optimiser + scheduler state |
+| `ckpt_epoch*.pt` | Periodic checkpoints (every {cfg.save_every} epochs) |
+| `train_config.json` | Full `TrainConfig` serialised to JSON |
+| `training_history.json` | Per-epoch train + val metrics (full structured record) |
+| `training_history_train.csv` | Train metrics per epoch (easy to open in pandas / Excel) |
+| `training_history_val.csv` | Validation metrics per eval epoch |
+| `tb/` | TensorBoard event files |
+
+---
+
+## TensorBoard
+
+After downloading the `tb/` folder:
+
+```bash
+pip install tensorboard
+tensorboard --logdir tb/
+```
+
+Available dashboards:
+- `step/*` — per-step loss and learning rate
+- `epoch/train_*` — per-epoch training averages
+- `epoch/val_*` — per-epoch validation averages
+- `compare/L1` — train vs val L1 on a single chart
+
+---
+
+## Usage
+
+```python
+import torch
+from modules.transformer import SwaraJEPA
+
+ckpt  = torch.load("ckpt_final.pt", map_location="cpu")
+cfg   = ckpt["config"]              # TrainConfig dataclass
+
+model = SwaraJEPA(
+    n_vocab_text    = cfg.n_vocab_text,
+    n_vocab_phoneme = ...,           # match your phoneme tokenizer
+    d_model         = cfg.d_model,
+    n_attn_heads    = cfg.n_heads,
+    enc_layers      = cfg.enc_layers,
+    can_dec_layers  = cfg.can_dec_layers,
+)
+model.load_state_dict(ckpt["model"])
+model.eval()
+```
+"""
+        card_path = self.run_dir / "README.md"
+        card_path.write_text(card, encoding="utf-8")
+        log.info("Model card → %s", card_path)
+
+    # ━━ NEW: HuggingFace Hub upload ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    def push_to_hub(self) -> None:
+        """
+        Upload the entire run directory to HuggingFace Hub.
+
+        Uploads (everything inside run_dir/):
+          ckpt_final.pt, ckpt_epoch*.pt
+          train_config.json
+          training_history.json / *.csv
+          tb/   (TensorBoard event files)
+          README.md (model card)
+
+        Token resolution order:
+          1. cfg.hf_token
+          2. HF_TOKEN  environment variable
+          3. Cached credentials from `huggingface-cli login`
+        """
+        try:
+            from huggingface_hub import HfApi, create_repo
+        except ImportError:
+            log.error(
+                "huggingface_hub is not installed. "
+                "Run:  pip install huggingface_hub"
+            )
+            return
+
+        cfg = self.cfg
+        if not cfg.hf_repo_id:
+            log.error(
+                "push_to_hub=True but hf_repo_id is empty. "
+                "Set --hf_repo_id username/repo-name and retry."
+            )
+            return
+
+        # ── Resolve token ─────────────────────────────────────────────────
+        token: str | None = (
+            cfg.hf_token
+            or os.environ.get("HF_TOKEN")
+            or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+            or None          # fall back to cached CLI credentials
+        )
+
+        api = HfApi(token=token)
+
+        # ── Create repo if it doesn't exist ───────────────────────────────
+        try:
+            create_repo(
+                repo_id=cfg.hf_repo_id,
+                repo_type="model",
+                private=cfg.hf_private,
+                token=token,
+                exist_ok=True,
+            )
+            log.info("Hub repo ready: %s", cfg.hf_repo_id)
+        except Exception as exc:
+            log.error("Failed to create/access repo '%s': %s", cfg.hf_repo_id, exc)
+            return
+
+        # ── Persist artefacts that live alongside the checkpoints ─────────
+        self._save_history()
+        self._save_model_card()
+
+        # ── Save train_config.json ─────────────────────────────────────────
+        config_path = self.run_dir / "train_config.json"
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump(asdict(cfg), f, indent=2)
+        log.info("Config → %s", config_path)
+
+        # ── Upload everything ─────────────────────────────────────────────
+        log.info(
+            "Uploading %s → https://huggingface.co/%s …",
+            self.run_dir, cfg.hf_repo_id,
+        )
+        try:
+            api.upload_folder(
+                folder_path=str(self.run_dir),
+                repo_id=cfg.hf_repo_id,
+                repo_type="model",
+                token=token,
+                commit_message=(
+                    f"SwaraJEPA phase-1 — epoch {self.epoch} "
+                    f"| {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}"
+                ),
+            )
+            log.info(
+                "✓ Upload complete → https://huggingface.co/%s",
+                cfg.hf_repo_id,
+            )
+        except Exception as exc:
+            log.error("Hub upload failed: %s", exc)
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
     # ── Public entry-point ────────────────────────────────────────────────
 
     def train(self, resume: str | None = None) -> None:
@@ -332,6 +648,11 @@ class Trainer:
             self._epoch_loop()
         finally:
             self.writer.close()   # always flush TensorBoard, even on crash
+
+        # ── NEW: push to Hub after a clean finish ─────────────────────────
+        if cfg.push_to_hub:
+            self.push_to_hub()
+        # ─────────────────────────────────────────────────────────────────
 
     # ── Internal epoch loop ───────────────────────────────────────────────
 
@@ -409,6 +730,10 @@ class Trainer:
                 ep.get("lr",         float("nan")),
             )
 
+            # ── NEW: record train history ──────────────────────────────────
+            self.history["train"].append({"epoch": epoch + 1, **ep})
+            # ─────────────────────────────────────────────────────────────
+
             # ── periodic evaluation ───────────────────────────────────────
             if (epoch + 1) % cfg.eval_every == 0:
                 last_val = self.evaluate()
@@ -431,6 +756,10 @@ class Trainer:
                         last_val.get("L_canon",    float("nan")),
                         last_val.get("L_canonlen", float("nan")),
                     )
+
+                    # ── NEW: record val history ────────────────────────────
+                    self.history["val"].append({"epoch": epoch + 1, **last_val})
+                    # ─────────────────────────────────────────────────────
 
             # ── periodic checkpoint ───────────────────────────────────────
             if (epoch + 1) % cfg.save_every == 0:
@@ -455,6 +784,9 @@ class Trainer:
                 last_val.get("L_canon",    float("nan")),
                 last_val.get("L_canonlen", float("nan")),
             )
+            # ── NEW: record final val ─────────────────────────────────────
+            self.history["val"].append({"epoch": cfg.num_epochs, **last_val})
+            # ─────────────────────────────────────────────────────────────
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -492,6 +824,33 @@ def parse_args() -> argparse.Namespace:
                    help="Run validation every N epochs")
     p.add_argument("--save_every",    type=int,   default=5,
                    help="Save a checkpoint every N epochs")
+
+    # ── NEW: HuggingFace Hub ──────────────────────────────────────────────
+    p.add_argument(
+        "--push_to_hub",
+        action="store_true",
+        default=False,
+        help="Upload run_dir to HuggingFace Hub after training finishes",
+    )
+    p.add_argument(
+        "--hf_repo_id",
+        type=str,
+        default="",
+        help='Hub repository, e.g. "username/swara-jepa-phase1"',
+    )
+    p.add_argument(
+        "--hf_token",
+        type=str,
+        default="",
+        help="HuggingFace token (falls back to HF_TOKEN env var or cached login)",
+    )
+    p.add_argument(
+        "--hf_private",
+        action="store_true",
+        default=False,
+        help="Create the Hub repository as private",
+    )
+    # ─────────────────────────────────────────────────────────────────────
 
     return p.parse_args()
 
