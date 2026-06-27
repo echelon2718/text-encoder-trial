@@ -2,21 +2,6 @@ import torch
 import re
 from typing import Literal, Optional, List, Dict
 
-from phonemizer.backend.espeak.wrapper import EspeakWrapper
-from phonemizer import phonemize
-from phonemizer.separator import Separator
-EspeakWrapper.set_library(r'C:\Program Files\eSpeak NG\libespeak-ng.dll')
-
-def phonemize_txt(txt, lang='en-us'):
-    return phonemize(
-        txt,
-        language=lang,
-        backend='espeak',
-        separator=Separator(phone=' ', word=' | '),
-        strip=True,
-        preserve_punctuation=False
-    )
-
 class PhonemeTokenizer:
     PAD = "<pad>"
     UNK = "<unk>"
