@@ -60,6 +60,7 @@ class TrainConfig:
     dataset_path:   str   = "./data/complete_corpus.csv"
     val_fraction:   float = 0.05
     canon_type:     str   = "phoneme"          # "phoneme" or "text"
+    dataset_mode:   str   = "huggingface"
 
     # ── Model ─────────────────────────────────────────────────────────────
     n_vocab_text:   int   = 256                # byte-level vocabulary
