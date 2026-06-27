@@ -1,0 +1,5 @@
+datasets==3.2.0
+huggingface_hub==0.34.3
+pandas==3.0.3
+torch==2.7.0+cu126
+tqdm==4.67.1
