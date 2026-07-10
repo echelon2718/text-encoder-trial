@@ -22,17 +22,17 @@ Sebagai catatan metodologis, bagian ini menyajikan **rumusan teoretis dan justif
 
 Diberikan korpus $\mathcal{D} = \{X^{(i)}\}_{i=1}^{N}$, di mana setiap titik data merupakan himpunan *multi-view*:
 
-$$
+```math
 X^{(i)} = \{x_1^{(i)}, x_2^{(i)}, \ldots, x_V^{(i)}\}, \qquad i \in \{1, \ldots, N\}
-$$
+```
 
 dengan $x_1^{(i)}$ adalah bentuk **kanonik** (baku, gramatikal) dari kalimat ke-$i$, dan $\{x_2^{(i)}, \ldots, x_V^{(i)}\}$ adalah $V-1$ bentuk **non-kanonik** (variasi informal, disingkat, atau bernoise) dari kalimat yang sama. Setiap $x_j^{(i)}$ adalah barisan indeks token dengan panjang $L^{(i,j)}$ yang berbeda-beda antar view dan antar data. Untuk keperluan implementasi berbasis *mini-batch* berukuran $B$, satu batch data direpresentasikan sebagai tensor $x_j^{(i)} \in \mathbb{R}^{B \times L^{(i,j)}}$ dengan *padding* menyesuaikan panjang maksimum dalam batch; secara konseptual, pembahasan berikut mendeskripsikan operasi per satu titik data $i$.
 
 **Tujuan.** Membangun sebuah *embedding network* $f_\theta$ sedemikian rupa sehingga untuk setiap $i$ dan setiap $v \in \{1, \ldots, V\}$:
 
-$$
+```math
 f_\theta(x_v^{(i)}) \approx f_\theta(x_1^{(i)})
-$$
+```
 
 Dengan kata lain, seluruh variasi permukaan (*surface form*) dari suatu kalimat harus konvergen ke satu titik laten yang sama dengan bentuk kanoniknya — sebuah sifat yang dalam literatur representasi kalimat disebut *invariance* terhadap variasi non-semantik (bandingkan dengan tujuan *augmentation-invariance* pada SimCLR, Chen et al., 2020, dan pada VICReg, Bardes, Ponce, & LeCun, 2022, untuk domain citra).
 
@@ -91,21 +91,21 @@ T-LeJEPA melibatkan tiga jaringan terparametrisasi:
 
 Alur propagasi maju untuk titik data ke-$i$ adalah sebagai berikut. Pertama, seluruh view $\{x_1^{(i)}, \ldots, x_V^{(i)}\}$ diubah menjadi *embedding* token melalui lapisan *embedding* (termasuk *tokenization* subword bila relevan):
 
-$$
+```math
 X_{\text{emb}}^{(i)} = \{x_{\text{emb},1}^{(i)}, \ldots, x_{\text{emb},V}^{(i)}\}, \qquad x_{\text{emb},j}^{(i)} \in \mathbb{R}^{B \times C^{(i,j)} \times d}
-$$
+```
 
 dengan $C^{(i,j)}$ adalah panjang sekuens setelah tokenisasi (dapat berbeda dari $L^{(i,j)}$ akibat *subword splitting*) dan $d$ adalah dimensi *embedding*. Setiap view diteruskan ke *encoder* bersama (*weight-sharing* antar-view, sebagaimana lazim pada arsitektur *siamese* JEPA):
 
-$$
+```math
 f_\theta(X_{\text{emb}}^{(i)}) = Z^{(i)} = \{z_1^{(i)}, \ldots, z_V^{(i)}\}
-$$
+```
 
 Representasi $Z^{(i)}$ kemudian diteruskan secara paralel ke *canonical decoder* dan *length predictor*:
 
-$$
+```math
 g_\phi(Z^{(i)}) = Z_c^{(i)} = \{z_{c,1}^{(i)}, \ldots, z_{c,V}^{(i)}\}, \qquad \tau_\psi(Z^{(i)}) \to \hat{L}^{(i)}
-$$
+```
 
 **Batasan panjang keluaran.** Karena tujuan *decoder* adalah menerjemahkan setiap view non-kanonik ke bentuk kanonik, keluaran $z_{c,1}^{(i)}, \ldots, z_{c,V}^{(i)}$ dipaksa memiliki panjang sekuens yang sama dengan $z_1^{(i)}$ (panjang kanonik $L_{i,1}$). Selama pelatihan, panjang ini diberikan langsung dari data (*teacher forcing*, lihat Bagian 4.5); *decoder* tidak bergantung pada keluaran $\tau_\psi$ untuk menentukan ukuran kanvasnya sendiri saat pelatihan.
 
@@ -113,9 +113,9 @@ $$
 
 Komponen pertama menegakkan bahwa representasi hasil *decoder* dari setiap view — setelah diterjemahkan ke ruang kanonik — sama dengan representasi *encoder* dari bentuk kanonik aslinya:
 
-$$
+```math
 \mathcal{L}_{\text{syntactic}} = \frac{1}{NV} \sum_{n=1}^{N} \sum_{v=1}^{V} \left\| z_{c,n,v} - z_{n,1} \right\|_2^2 = \frac{1}{NV} \sum_{n=1}^{N} \sum_{v=1}^{V} \left\| g_\phi\big(f_\theta(x_{n,v}),\, L_{n,1}\big) - f_\theta(x_1^{(n)}) \right\|_2^2
-$$
+```
 
 Perhatikan bahwa **target** dari *loss* ini, $z_{n,1} = f_\theta(x_1^{(n)})$, adalah keluaran *encoder* atas teks kanonik itu sendiri — bukan rata-rata seluruh view seperti pada suku $\mathcal{L}_{\text{align}}$ LeJEPA orisinal ($\|z_{n,v} - \mu_n\|_2^2$ dengan $\mu_n = \frac{1}{V}\sum_v z_{n,v}$). Perbedaan ini bukan sekadar variasi teknis, melainkan konsekuensi logis dari perbedaan struktur data: pada JEPA citra, seluruh *view* (hasil augmentasi acak) berkedudukan setara — tidak ada "citra kanonik" — sehingga rata-rata populasi adalah estimator yang wajar bagi konten invarian. Pada T-LeJEPA, sebaliknya, terdapat *anchor* yang secara eksplisit diberikan oleh data ($x_1^{(i)}$), sehingga menggunakan rata-rata alih-alih anchor sebenarnya hanya akan menambah varians estimasi tanpa manfaat, sekaligus mengabaikan informasi yang tersedia secara *supervised* implisit dari struktur dataset. Justifikasi ini konsisten dengan prinsip umum estimasi statistik: ketika target sebenarnya tersedia, menggantinya dengan estimator (rata-rata sampel) hanya rasional jika target sebenarnya tidak teramati.
 
@@ -123,23 +123,23 @@ Perhatikan bahwa **target** dari *loss* ini, $z_{n,1} = f_\theta(x_1^{(n)})$, ad
 
 Komponen kedua menjawab keterbatasan $\mathcal{L}_{\text{syntactic}}$ yang disebutkan pada Bagian 2.2: penyamaan titik laten semata tidak menjamin bahwa *geometri* ruang laten antar kalimat yang berbeda mencerminkan kemiripan maknanya. Untuk itu, kami mendefinisikan operator *pooling* $\mu_L(\cdot)$ yang memetakan representasi token-level $z_{c,i,v} \in \mathbb{R}^{C \times d}$ menjadi vektor kalimat berdimensi tetap $\mu_L(z_{c,i,v}) \in \mathbb{R}^{d}$ melalui rata-rata sepanjang sumbu sekuens — strategi *mean pooling* yang mengikuti Sentence-BERT (Reimers & Gurevych, 2019):
 
-$$
+```math
 \mu_L(z) = \frac{1}{L} \sum_{t=1}^{L} z_t
-$$
+```
 
 Untuk setiap pasangan data $(i,j)$ dan setiap pasangan view $(v_1, v_2)$, kami mendefinisikan residual antara kemiripan kosinus hasil model dan skor guru semantik eksternal $s_{\text{teacher}}$ (mis. dari SimCSE atau Sentence-BERT terlatih pada data STS/NLI, dievaluasi pada pasangan kalimat kanonik $x_{i,1}, x_{j,1}$):
 
-$$
+```math
 d_{ij}^{(v_1,v_2)} = \operatorname{sim}\big(\mu_L(z_{c,i,v_1}),\, \mu_L(z_{c,j,v_2})\big) - s_{\text{teacher}}(x_{i,1}, x_{j,1})
-$$
+```
 
-$$
+```math
 D_{ij} = \begin{bmatrix} d_{ij}^{(1,1)} & \cdots & d_{ij}^{(1,V)} \\ \vdots & \ddots & \vdots \\ d_{ij}^{(V,1)} & \cdots & d_{ij}^{(V,V)} \end{bmatrix}, \qquad \delta_{ij} = \sum_{v_1=1}^{V}\sum_{v_2=1}^{V} \left(d_{ij}^{(v_1,v_2)}\right)^2 = \|D_{ij}\|_F^2
-$$
+```
 
-$$
+```math
 \mathcal{L}_{\text{semantic}} = \frac{1}{N^2} \sum_{i=1}^{N} \sum_{j=1}^{N} \delta_{ij} = \frac{1}{N^2} \sum_{i=1}^{N} \sum_{j=1}^{N} \|D_{ij}\|_F^2
-$$
+```
 
 Rumusan ini secara struktural setara dengan **distilasi matriks kemiripan berpasangan** (*similarity-preserving distillation*): alih-alih mencocokkan aktivasi tiap contoh secara independen terhadap model guru, kami mencocokkan **seluruh matriks kemiripan lintas-view lintas-data** terhadap struktur kemiripan yang diberikan model guru, mengikuti prinsip yang diperkenalkan Tung & Mori (2019) dan diperluas Park et al. (2019) dalam bentuk *distance-wise*/*angle-wise loss*. Peran model guru $s_{\text{teacher}}$ di sini adalah menyediakan sinyal semantik lunak (*soft, continuous label*) — bukan label biner keras — yang sesuai dengan sifat gradual kemiripan makna, sekaligus menjadi jawaban langsung terhadap tantangan ketidakpastian aleatorik yang dibahas pada Bagian 2.3: karena tidak ada anotasi manusia yang secara eksplisit menandai derajat ambiguitas suatu kalimat, sinyal distilasi dari model guru semantik pra-latih menjadi proksi yang dapat diskalakan tanpa anotasi tambahan.
 
@@ -147,9 +147,9 @@ Rumusan ini secara struktural setara dengan **distilasi matriks kemiripan berpas
 
 Mengikuti Balestriero & LeCun (2025), kami menerapkan SIGReg pada **keluaran mentah encoder** $f_\theta(x_{\text{emb}}^{(n)})$ — bukan pada keluaran *decoder* $Z_c$:
 
-$$
+```math
 \mathcal{L}_{\text{SIGReg}} = \frac{1}{V|A|} \sum_{v=1}^{V} \sum_{a \in A} T\Big(\big\{a^\top f_\theta(x_{\text{emb}}^{(n)})\big\}_{n=1}^{N}\Big)
-$$
+```
 
 dengan $A$ adalah himpunan arah proyeksi acak dan $T(\cdot)$ adalah statistik uji normalitas berbasis fungsi karakteristik (mis. Epps–Pulley), yang mengukur seberapa jauh distribusi proyeksi 1-dimensi $\{a^\top z_n\}_n$ menyimpang dari distribusi Gaussian standar $\mathcal{N}(0,1)$. Validitas pendekatan berbasis proyeksi ini dijamin teorema Cramér–Wold: kesesuaian seluruh proyeksi 1-dimensi terhadap Gaussian standar setara dengan kesesuaian distribusi multivariat penuh terhadap $\mathcal{N}(\mathbf{0}, \mathbf{I})$.
 
@@ -161,9 +161,9 @@ Kami juga mencatat bahwa $\mathcal{L}_{\text{semantic}}$ tidak berkompetisi deng
 
 Mengadopsi skema Gu et al. (2018), $\tau_\psi$ dilatih meregresi panjang kanonik sebenarnya dari representasi *encoder* setiap view:
 
-$$
+```math
 \mathcal{L}_{\text{canonlen}} = \frac{1}{NV} \sum_{n=1}^{N} \sum_{v=1}^{V} \left\| L_{n,1} - \hat{L}_{n,v} \right\|_2^2 = \frac{1}{NV} \sum_{n=1}^{N} \sum_{v=1}^{V} \left\| L_{n,1} - \tau_\psi(z_{n,v}) \right\|_2^2
-$$
+```
 
 Selama pelatihan, panjang kanvas keluaran $g_\phi$ ditentukan oleh panjang kanonik **sebenarnya** $L_{n,1}$ (teacher forcing), bukan oleh $\hat{L}_{n,v}$ — memastikan sinyal gradien pada $\mathcal{L}_{\text{syntactic}}$ dan $\mathcal{L}_{\text{semantic}}$ tidak terganggu oleh kesalahan prediksi panjang pada tahap awal pelatihan, ketika $\tau_\psi$ belum akurat. $\tau_\psi$ tetap dilatih secara paralel terhadap panjang sebenarnya, dan **hanya digunakan saat inferensi**, ketika $L_{n,1}$ tidak lagi tersedia untuk view non-kanonik yang belum diketahui bentuk bakunya.
 
@@ -171,15 +171,15 @@ Selama pelatihan, panjang kanvas keluaran $g_\phi$ ditentukan oleh panjang kanon
 
 Secara konseptual, tiga komponen di atas dapat dikelompokkan ke dalam dua tujuan utama — pembentukan *embedding* kanonik (sintaktik + semantik) dan pencegahan *collapse* (SIGReg):
 
-$$
+```math
 \mathcal{L}_{\text{T-LeJEPA}} = \underbrace{\underbrace{\frac{1}{NV}\sum_{n=1}^{N}\sum_{v=1}^{V} \|z_{c,n,v} - z_{n,1}\|_2^2}_{\mathcal{L}_{\text{syntactic}}} + \underbrace{\frac{1}{N^2}\sum_{i=1}^{N}\sum_{j=1}^{N} \|D_{ij}\|_F^2}_{\mathcal{L}_{\text{semantic}}}}_{\text{Canonical Embedding Objective}} \;+\; \underbrace{\frac{1}{V|A|}\sum_{v=1}^{V}\sum_{a \in A} T\big(\{a^\top f_\theta(x_{\text{emb}}^{(n)})\}_{n=1}^{N}\big)}_{\mathcal{L}_{\text{SIGReg}}}
-$$
+```
 
 Untuk pelatihan aktual, dua hiperparameter trade-off diperkenalkan: $\lambda \in (0,1)$ mengatur keseimbangan antara tujuan pembentukan *embedding* kanonik dan pencegahan *collapse* (mengikuti peran $\lambda$ pada LeJEPA orisinal), sementara $\beta > 0$ mengatur bobot relatif $\mathcal{L}_{\text{semantic}}$ terhadap $\mathcal{L}_{\text{syntactic}}$ di dalam tujuan pembentukan *embedding* kanonik:
 
-$$
+```math
 \mathcal{L}_{\text{total}} = (1-\lambda)\big[\mathcal{L}_{\text{syntactic}} + \beta\, \mathcal{L}_{\text{semantic}}\big] + \lambda\, \mathcal{L}_{\text{SIGReg}}
-$$
+```
 
 Komponen $\mathcal{L}_{\text{canonlen}}$ dioptimalkan secara terpisah (dengan bobot tersendiri atau dijumlahkan langsung, karena skalanya independen dari ruang *embedding* $d$-dimensi) dan tidak memengaruhi gradien $\theta, \phi$ secara langsung — hanya memperbarui $\psi$ — sehingga tidak disertakan dalam trade-off $\lambda,\beta$ di atas.
 
