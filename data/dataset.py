@@ -23,20 +23,20 @@ def collate_fn(batch, pad_value=0):
         for seq, l in zip(sample["x"], sample["x_lengths"]):
             seq = F.pad(
                 seq,
-                (0, max_len - len(seq)),
+                (1, 1),
                 value = pad_value
             )
 
             seq = F.pad(
                 seq,
-                (1, 1),
+                (0, max_len - len(seq)),
                 value = pad_value
             )
 
             padded.append(seq)
 
-            m = torch.arange(max_len) < l
-            m = F.pad(m, (1, 1), value=False)
+            m = torch.ones(l + 2, dtype=torch.bool)  # +2 for the zero padding on both sides
+            m = F.pad(m, (0, max_len - len(m)), value=False)
 
             masks.append(m)
         
@@ -46,6 +46,7 @@ def collate_fn(batch, pad_value=0):
     return {
         "id": [b["id"] for b in batch],
         "x": torch.stack(batch_x),
+        "texts": [[b["x_canon_text"]] + b["x_aug_1"] + b["x_aug_2"] for b in batch],
         "x_lengths": [
             [l + 2 for l in b["x_lengths"]] for b in batch
         ],
@@ -99,7 +100,8 @@ class AugmentDataset(Dataset):
 
         return {
             "id": data_id,
-            "x_canon": phoneme if canon_mode == "phoneme" else text,
+            "x_canon": phoneme,
+            "x_canon_text": text,
             "x_aug_1": x_aug_1,
             "x_aug_2": x_aug_2,
             "x": [x_canon] + x_v,
