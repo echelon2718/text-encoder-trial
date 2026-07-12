@@ -1,8 +1,8 @@
 import argparse
 import torch
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader
 
-from data.dataset import AugmentDataset, collate_fn
+from data.dataset import AugmentDataset, BatchSampler, collate_fn
 from modules.tlejepa import TLeJEPA
 from modules.training import Trainer
 from modules.losses import (
@@ -12,28 +12,19 @@ from modules.losses import (
     CachedSemanticTeacherSimilarity,
 )
 
+from modules.utils import core_split
+
 def get_args():
     parser = argparse.ArgumentParser(description="Train TLeJEPA")
-    parser.add_argument(
-        "--lexicon-path",
-        type=str,
-        default="./lexicon/abbrev-lexicon.json"
-    )
-    parser.add_argument(
-        "--dataset-path",
-        type=str,
-        default="../data/complete_corpus.csv"
-    )
-    parser.add_argument(
-        "--dataset-mode",
-        type=str,
-        default="huggingface",
-        choices=["local", "huggingface"]
-    )
+    parser.add_argument("--lexicon-path", type=str, default="./lexicon/abbrev-lexicon.json")
+    parser.add_argument("--dataset-path", type=str, default="./data/english_singlish_g2p.csv")
+    parser.add_argument("--dataset-mode", type=str, default="huggingface", choices=["local", "huggingface"])
 
     parser.add_argument("--train-ratio", type=float, default=0.9)
     parser.add_argument("--batch-size", type=int, default=6)
     parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--n_singlish", type=int, default=2)
+    parser.add_argument("--n_premise_and_negation", type=int, default=2)
 
     parser.add_argument("--d-model", type=int, default=256)
     parser.add_argument("--heads", type=int, default=8)
@@ -58,40 +49,73 @@ def get_args():
 
 
 def main(args):
-    dataset = AugmentDataset(
+    full_dataset = AugmentDataset(
         lexicon_path=args.lexicon_path,
         dataset_path=args.dataset_path,
         mode=args.dataset_mode,
     )
 
-    train_size = int(args.train_ratio * len(dataset))
-    val_size = len(dataset) - train_size
+    train_size = int(args.train_ratio * len(full_dataset))
+    val_size = len(full_dataset) - train_size
 
-    train_dataset, val_dataset = random_split(
-        dataset,
-        [train_size, val_size],
-        generator=torch.Generator().manual_seed(args.seed),
+    g = torch.Generator().manual_seed(args.seed)
+    perm = torch.randperm(len(full_dataset), generator=g).tolist()
+
+    train_idx = perm[:train_size]
+    val_idx = perm[train_size:]
+
+    train_df = full_dataset.dataset.iloc[train_idx].reset_index(drop=True)
+    val_df = full_dataset.dataset.iloc[val_idx].reset_index(drop=True)
+
+    train_dataset = AugmentDataset(
+        lexicon_path=args.lexicon_path,
+        dataframe=train_df,
+        tokenizer=full_dataset.phoneme_tokenizer,
+    )
+
+    val_dataset = AugmentDataset(
+        lexicon_path=args.lexicon_path,
+        dataframe=val_df,
+        tokenizer=full_dataset.phoneme_tokenizer,
+    )
+
+    train_sampler = BatchSampler(
+        df=train_dataset.dataset,
+        batch_size=args.batch_size,
+        n_singlish_per_batch=args.n_singlish,
+        n_negation_per_batch=args.n_premise_and_negation,
+        seed=args.seed,
+        drop_last=True,
+    )
+
+    val_sampler = BatchSampler(
+        df=val_dataset.dataset,
+        batch_size=args.batch_size,
+        n_singlish_per_batch=args.n_singlish,
+        n_negation_per_batch=args.n_premise_and_negation,
+        seed=args.seed,
+        drop_last=False,
     )
 
     train_loader = DataLoader(
         train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
+        batch_sampler=train_sampler,
         num_workers=args.num_workers,
         collate_fn=collate_fn,
+        pin_memory=True,
     )
 
     val_loader = DataLoader(
         val_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
+        batch_sampler=val_sampler,
         num_workers=args.num_workers,
         collate_fn=collate_fn,
+        pin_memory=True,
     )
 
     model = TLeJEPA(
         n_vocab_text=256,
-        n_vocab_phoneme=dataset.phoneme_tokenizer.vocab_size,
+        n_vocab_phoneme=full_dataset.phoneme_tokenizer.vocab_size,
         d_model=args.d_model,
         n_attn_heads=args.heads,
         enc_layers=args.enc_layers,
@@ -121,6 +145,9 @@ def main(args):
         model=model,
         optimizer=optimizer,
         criterion=criterion,
+        n_core=args.batch_size,
+        n_singlish=args.n_singlish,
+        n_premise_and_negation=args.n_premise_and_negation,
         device=torch.device(args.device),
     )
 
@@ -128,6 +155,7 @@ def main(args):
         num_epochs=args.epochs,
         lr_scheduler=None,
     )
+
 
 if __name__ == "__main__":
     args = get_args()
