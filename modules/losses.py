@@ -40,15 +40,28 @@ def masked_mean(z: torch.Tensor, mask: torch.Tensor, eps: float = 1e-6) -> torch
 
 class SemanticTeacherSimilarity(nn.Module):
     def __init__(self, teacher_model: str = "tum-nlp/NegMPNet"):
-        super(SemanticTeacherSimilarity, self).__init__()
+        super().__init__()
         self.teacher_semantic_model = SentenceTransformer(teacher_model).eval()
 
-    def forward(self, batch: dict):
-        canonical_texts_from_batch = [text[0] for text in batch['texts']]
+    def forward(
+        self,
+        batch: dict,
+        n_core: int = 64,
+        negation_offset: int = 62,
+        n_negation: int = 2,
+    ) -> torch.Tensor:
+        canonical_texts = [t[0] for t in batch['texts']]
         with torch.no_grad():
-            canonical_semantic_embeddings = self.teacher_semantic_model.encode(canonical_texts_from_batch, convert_to_tensor=True)
-        cosine_sim_matrix = (canonical_semantic_embeddings @ canonical_semantic_embeddings.T) / (canonical_semantic_embeddings.norm(dim=1, keepdim=True).T * canonical_semantic_embeddings.norm(dim=1, keepdim=True))
-        return cosine_sim_matrix
+            emb = self.teacher_semantic_model.encode(canonical_texts, convert_to_tensor=True)
+        emb = F.normalize(emb, dim=-1, eps=1e-8)
+
+        emb_A = emb[:n_core]
+        emb_B = torch.cat(
+            [emb[:negation_offset], emb[n_core:n_core + n_negation]],
+            dim=0,
+        )
+        return emb_A @ emb_B.t()  # (n_core, n_core)
+
 
 class CachedSemanticTeacherSimilarity(nn.Module):
     def __init__(self, base_teacher: nn.Module, cache_size: int = 500_000):
@@ -59,58 +72,86 @@ class CachedSemanticTeacherSimilarity(nn.Module):
         self.base_teacher.eval()
         self._cache: dict = {}
         self._cache_size = cache_size
- 
+
     def train(self, mode: bool = True):
         self.base_teacher.eval()
         return self
-    
+
     @torch.no_grad()
-    def forward(self, batch: dict) -> torch.Tensor:
+    def forward(
+        self,
+        batch: dict,
+        n_core: int = 64,
+        negation_offset: int = 62,
+        n_negation: int = 2,
+    ) -> torch.Tensor:
         ids = batch["id"]
         texts = [t[0] for t in batch["texts"]]
-        device = next(self.base_teacher.teacher_semantic_model.parameters(), torch.tensor(0.0)).device \
-            if hasattr(self.base_teacher.teacher_semantic_model, "parameters") else torch.device("cpu")
- 
+        device = (
+            next(self.base_teacher.teacher_semantic_model.parameters(), torch.tensor(0.0)).device
+            if hasattr(self.base_teacher.teacher_semantic_model, "parameters")
+            else torch.device("cpu")
+        )
+
         missing_idx = [i for i, _id in enumerate(ids) if _id not in self._cache]
         if missing_idx:
             missing_texts = [texts[i] for i in missing_idx]
             new_embs = self.base_teacher.teacher_semantic_model.encode(missing_texts, convert_to_tensor=True)
+            new_embs = F.normalize(new_embs, dim=-1, eps=1e-8)
             for local_i, global_i in enumerate(missing_idx):
                 if len(self._cache) < self._cache_size:
                     self._cache[ids[global_i]] = new_embs[local_i].detach().cpu()
- 
-        stacked = torch.stack([self._cache[_id] for _id in ids]).to(device)
-        norm = stacked.norm(dim=1, keepdim=True)
-        sim = (stacked @ stacked.T) / (norm @ norm.T + 1e-8)
-        return sim
- 
+
+        emb = torch.stack([self._cache[_id] for _id in ids]).to(device)
+
+        emb_A = emb[:n_core]
+        emb_B = torch.cat(
+            [emb[:negation_offset], emb[n_core:n_core + n_negation]],
+            dim=0,
+        )
+        return emb_A @ emb_B.t()
+
     def cache_stats(self) -> dict:
         return {"cached_sentences": len(self._cache)}
 
-def semantic_loss(batch: dict, out: dict, cossim_fn: SemanticTeacherSimilarity, eps: float = 1e-6) -> torch.Tensor:
-    z_c = out['z_v_canon']
+
+def semantic_loss(
+    batch: dict,
+    out: dict,
+    cossim_fn,
+    eps: float = 1e-6,
+    n_core: int = 64,
+    negation_offset: int = 62,
+    n_negation: int = 2,
+) -> torch.Tensor:
+    z_c = out['z_v_canon']       # (B_total, V, L, d), B_total = n_core + n_negation (mis. 66)
     m_c = out['masks_v_canon']
-    B, V, _, d = z_c.shape
 
-    teacher_sim = cossim_fn(batch)
-
-    assert teacher_sim.shape == (B, B), (
-        f"teacher_sim harus berbentuk (B, B) = ({B}, {B}), didapat {tuple(teacher_sim.shape)}"
-    )
-
-    pooled = masked_mean(z_c, m_c, eps=eps)
+    pooled = masked_mean(z_c, m_c, eps=eps)             # (B_total, V, d)
     pooled_norm = F.normalize(pooled, dim=-1, eps=eps)
 
-    flat = pooled_norm.reshape(B * V, d)
-    sim_all = flat @ flat.t()
-    sim_all = sim_all.view(B, V, B, V)
-    sim_all = sim_all.permute(0, 2, 1, 3)
+    V, d = pooled_norm.shape[1], pooled_norm.shape[2]
 
-    D = sim_all.to(out['z_v_canon'].device) - teacher_sim.view(B, B, 1, 1).to(out['z_v_canon'].device)
+    pooled_A = pooled_norm[:n_core]                                            # (n_core, V, d)
+    pooled_B = torch.cat(
+        [pooled_norm[:negation_offset], pooled_norm[n_core:n_core + n_negation]],
+        dim=0,
+    )                                                                            # (n_core, V, d)
 
+    flat_A = pooled_A.reshape(n_core * V, d)
+    flat_B = pooled_B.reshape(n_core * V, d)
+
+    sim_all = flat_A @ flat_B.t()                          # (n_core*V, n_core*V)
+    sim_all = sim_all.view(n_core, V, n_core, V).permute(0, 2, 1, 3)  # (n_core, n_core, V, V)
+
+    teacher_sim = cossim_fn(batch, n_core=n_core, negation_offset=negation_offset, n_negation=n_negation)
+    assert teacher_sim.shape == (n_core, n_core), (
+        f"teacher_sim harus ({n_core},{n_core}), didapat {tuple(teacher_sim.shape)}"
+    )
+
+    D = sim_all - teacher_sim.view(n_core, n_core, 1, 1).to(sim_all.device)
     delta = D.pow(2).sum(dim=(-2, -1))
-
-    return delta.sum() / (B ** 2)
+    return delta.sum() / (n_core ** 2)
 
 class SIGReg(nn.Module):
     def __init__(self, knots: int = 17, num_slices: int = 256, t_max: float = 3.0):
@@ -138,7 +179,7 @@ def sigreg_loss(out: dict, sigreg_fn: "SIGReg") -> torch.Tensor:
     pooled = masked_mean(z_v, masks)                # (B, V, d) -- SATU vektor per kalimat per view
     return sigreg_fn(pooled.transpose(0, 1))        # -> (V, B, d): N=B jadi populasi
     
-def compute_losses(model, batch, criterion, device, use_amp: bool = True, amp_dtype=torch.bfloat16, canon_type: str = "phoneme"):
+def compute_losses(model, batch, criterion, n_core, n_negation, device, use_amp: bool = True, amp_dtype=torch.bfloat16, canon_type: str = "phoneme"):
     batch = move_batch_to_device(batch, device)
  
     autocast_enabled = use_amp and device.type == "cuda"
@@ -146,7 +187,7 @@ def compute_losses(model, batch, criterion, device, use_amp: bool = True, amp_dt
         out = model.train_forward(batch, type=canon_type)
  
         l_syn = syntactical_loss(out)
-        l_sem = semantic_loss(batch, out, criterion.cossim_fn)
+        l_sem = semantic_loss(batch, out, criterion.cossim_fn, n_core=n_core, negation_offset=n_core - n_negation, n_negation=n_negation) # notes, n_core is batch size
         l_sig = sigreg_loss(out, criterion.sigreg_fn)
         l_len = canon_len_loss(out)
  
