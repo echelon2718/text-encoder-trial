@@ -10,7 +10,7 @@ from tqdm.auto import tqdm
 from typing import Optional
 
 from modules.losses import compute_losses, TLeJEPACriterion
-from modules.utils import move_batch_to_device, masked_mean
+from modules.utils import move_batch_to_device, masked_mean, core_split
 
 try:
     from sklearn.manifold import TSNE
@@ -22,13 +22,13 @@ if _HAS_SKLEARN:
     from sklearn.manifold import TSNE
     from sklearn.decomposition import PCA
 
-def train_step(model, optimizer, batch, criterions, device,
+def train_step(model, optimizer, batch, criterions, n_core, n_negation, device,
                use_amp=True, amp_dtype=torch.bfloat16, grad_clip: Optional[float] = 1.0,
                canon_type: str = "phoneme"):
     model.train()
     optimizer.zero_grad(set_to_none=True)
     total, losses, out, _ = compute_losses(
-        model, batch, criterions, device,
+        model, batch, criterions, n_core, n_negation, device,
         use_amp=use_amp, amp_dtype=amp_dtype, canon_type=canon_type
     )
     total.backward()
@@ -87,6 +87,9 @@ class Trainer:
         model,
         optimizer,
         criterion: TLeJEPACriterion,
+        n_core: int,
+        n_singlish: int,
+        n_premise_and_negation: int,
         device: Optional[torch.device] = None,
         log_dir: str = "runs/tlejepa",
         ckpt_dir: str = "checkpoints",
@@ -115,6 +118,9 @@ class Trainer:
         self.log_every_n_steps = log_every_n_steps
         self.visualize_every_n_epochs = visualize_every_n_epochs
         self.n_vis_samples = n_vis_samples
+        self.n_core = n_core
+        self.n_singlish = n_singlish
+        self.n_pneg = n_premise_and_negation
  
         self.ckpt_dir = ckpt_dir
         os.makedirs(ckpt_dir, exist_ok=True)
@@ -142,7 +148,7 @@ class Trainer:
  
         for step, batch in enumerate(pbar):
             losses, _ = train_step(
-                self.model, self.optimizer, batch, self.criterion,
+                self.model, self.optimizer, batch, self.criterion, self.n_core, self.n_pneg,
                 self.device, use_amp=self.use_amp,
                 amp_dtype=self.amp_dtype, grad_clip=self.grad_clip, canon_type=self.canon_type,
             )
