@@ -3,6 +3,12 @@ import random
 import numpy as np
 import matplotlib.pyplot as plt
 
+def core_split(X, singlish_and_pn_ratio=0.1):
+    eval_size = round(X * singlish_and_pn_ratio)
+    test_size = eval_size
+    train_size = X - eval_size - test_size
+    return train_size, eval_size, test_size
+
 def length_to_mask(lengths: torch.Tensor, max_len: int) -> torch.Tensor:
     return torch.arange(max_len, device=lengths.device).unsqueeze(0) < lengths.unsqueeze(1)
 
