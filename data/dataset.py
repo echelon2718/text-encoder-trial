@@ -146,6 +146,14 @@ class AugmentDataset(Dataset):
         return self._n
 
     def __getitem__(self, idx, n_aug_1=3, n_aug_2=2, canon_mode="phoneme"):
+        try:
+            return self._getitem_impl(idx, n_aug_1, n_aug_2, canon_mode)
+        except Exception as e:
+            fallback_idx = (idx + 1) % self._n
+            print(f"[AugmentDataset] idx={idx} korup ({e!r}), fallback ke idx={fallback_idx}")
+            return self._getitem_impl(fallback_idx, n_aug_1, n_aug_2, canon_mode)
+
+    def _getitem_impl(self, idx, n_aug_1=3, n_aug_2=2, canon_mode="phoneme"):
         assert canon_mode in ("phoneme", "text"), (
             "Unknown canon repr. return mode. It has to be either phoneme or text."
         )
