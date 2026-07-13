@@ -69,7 +69,7 @@ class BatchSampler(Sampler):
         return self.n_batches
 
 def collate_fn(batch, pad_value=0):
-    max_len = max(seq.shape[0] for sample in batch for seq in sample["x"])
+    max_len = max(seq.shape[0] for sample in batch for seq in sample["x"]) + 2
  
     batch_x = []
     batch_mask = []
