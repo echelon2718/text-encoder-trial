@@ -25,6 +25,7 @@ def get_args():
     parser.add_argument("--train-ratio", type=float, default=0.9)
     parser.add_argument("--batch-size", type=int, default=6)
     parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--prefetch-factor", type=int, default=4)
     parser.add_argument("--n_singlish", type=int, default=2)
     parser.add_argument("--n_premise_and_negation", type=int, default=2)
 
@@ -124,12 +125,18 @@ def main(args):
         drop_last=False,
     )
 
+    loader_extra_kwargs = (
+        {"persistent_workers": True, "prefetch_factor": args.prefetch_factor}
+        if args.num_workers > 0 else {}
+    )
+
     train_loader = DataLoader(
         train_dataset,
         batch_sampler=train_sampler,
         num_workers=args.num_workers,
         collate_fn=collate_fn,
         pin_memory=True,
+        **loader_extra_kwargs,
     )
 
     val_loader = DataLoader(
@@ -138,6 +145,7 @@ def main(args):
         num_workers=args.num_workers,
         collate_fn=collate_fn,
         pin_memory=True,
+        **loader_extra_kwargs,
     )
 
     model = TLeJEPA(
@@ -150,6 +158,7 @@ def main(args):
         max_length=args.max_length,
         dropout=args.dropout,
     )
+    model.set_gradient_checkpointing(True)
 
     criterion = TLeJEPACriterion(
         sigreg_fn=SIGReg(num_slices=args.num_slices),
