@@ -78,13 +78,7 @@ class CachedSemanticTeacherSimilarity(nn.Module):
         return self
 
     @torch.no_grad()
-    def forward(
-        self,
-        batch: dict,
-        n_core: int = 64,
-        negation_offset: int = 62,
-        n_negation: int = 2,
-    ) -> torch.Tensor:
+    def forward(self, batch, n_core=64, negation_offset=62, n_negation=2):
         ids = batch["id"]
         texts = [t[0] for t in batch["texts"]]
         device = (
@@ -92,23 +86,25 @@ class CachedSemanticTeacherSimilarity(nn.Module):
             if hasattr(self.base_teacher.teacher_semantic_model, "parameters")
             else torch.device("cpu")
         )
-
+    
         missing_idx = [i for i, _id in enumerate(ids) if _id not in self._cache]
+        local_lookup = {}
         if missing_idx:
             missing_texts = [texts[i] for i in missing_idx]
             new_embs = self.base_teacher.teacher_semantic_model.encode(missing_texts, convert_to_tensor=True)
             new_embs = F.normalize(new_embs, dim=-1, eps=1e-8)
             for local_i, global_i in enumerate(missing_idx):
+                emb_i = new_embs[local_i].detach().cpu()
+                local_lookup[ids[global_i]] = emb_i          # selalu tersedia utk batch ini
                 if len(self._cache) < self._cache_size:
-                    self._cache[ids[global_i]] = new_embs[local_i].detach().cpu()
-
-        emb = torch.stack([self._cache[_id] for _id in ids]).to(device)
-
+                    self._cache[ids[global_i]] = emb_i         # persist hanya kalau masih ada slot
+    
+        emb = torch.stack([
+            self._cache.get(_id, local_lookup.get(_id)) for _id in ids
+        ]).to(device)
+    
         emb_A = emb[:n_core]
-        emb_B = torch.cat(
-            [emb[:negation_offset], emb[n_core:n_core + n_negation]],
-            dim=0,
-        )
+        emb_B = torch.cat([emb[:negation_offset], emb[n_core:n_core + n_negation]], dim=0)
         return emb_A @ emb_B.t()
 
     def cache_stats(self) -> dict:
