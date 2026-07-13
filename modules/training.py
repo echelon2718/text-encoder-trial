@@ -5,6 +5,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 import os
 import time
+import uuid
+import datetime
 from torch.utils.tensorboard import SummaryWriter
 from tqdm.auto import tqdm
 from typing import Optional
@@ -102,8 +104,25 @@ class Trainer:
         n_vis_projection_dirs: int = 3,
         n_vis_samples: int = 6,
         seed: int = 42,
+        label: str = "run",
     ):
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        # --- Identitas unik untuk eksekusi ini ---------------------------------
+        # Supaya beberapa run paralel (parameter beda) tidak saling overwrite
+        # checkpoint/log satu sama lain, setiap instansiasi Trainer men-generate
+        # run_id unik sekali di awal: "<label>-<random_id>-<HH:mm:SS DD/MM/YYYY>"
+        self.label = label
+        self.random_id = uuid.uuid4().hex[:8]
+        self._run_timestamp = datetime.datetime.now().strftime("%H:%M:%S %d/%m/%Y")
+        self.run_id = f"{self.label}-{self.random_id}-{self._run_timestamp}"
+        print(f"Executing training ID: {self.random_id}")
+
+        # ':' dan '/' tidak valid sebagai nama file/folder di banyak filesystem
+        # (khususnya Windows), jadi dipakai versi "aman" khusus untuk path.
+        self._run_id_safe = (
+            self.run_id.replace("/", "-").replace(":", "-").replace(" ", "_")
+        )
 
         self.train_loader = train_loader
         self.val_loader = val_loader
@@ -122,10 +141,15 @@ class Trainer:
         self.n_singlish = n_singlish
         self.n_pneg = n_premise_and_negation
 
-        self.ckpt_dir = ckpt_dir
-        os.makedirs(ckpt_dir, exist_ok=True)
+        # Checkpoint tiap run disimpan di subfolder sendiri: <ckpt_dir>/<run_id>/...
+        self.ckpt_dir = os.path.join(ckpt_dir, self._run_id_safe)
+        os.makedirs(self.ckpt_dir, exist_ok=True)
 
-        self.writer = SummaryWriter(log_dir=log_dir)
+        # Log TensorBoard juga dipisah per run, dengan alasan yang sama.
+        run_log_dir = os.path.join(log_dir, self._run_id_safe)
+        self.writer = SummaryWriter(log_dir=run_log_dir)
+        self.writer.add_text("run_info/run_id", self.run_id, global_step=0)
+
         self.global_step = 0
         self.best_val_loss = float("inf")
 
@@ -387,11 +411,13 @@ class Trainer:
             if improved:
                 self.best_val_loss = val_loss["total"]
                 save_model(os.path.join(self.ckpt_dir, "best_model.pt"),
-                           self.model, self.optimizer, epoch, self.best_val_loss)
+                           self.model, self.optimizer, epoch, self.best_val_loss,
+                           extra={"run_id": self.run_id})
 
             if epoch % save_every_n_epochs == 0:
                 save_model(os.path.join(self.ckpt_dir, "latest_model.pt"),
-                           self.model, self.optimizer, epoch, self.best_val_loss)
+                           self.model, self.optimizer, epoch, self.best_val_loss,
+                           extra={"run_id": self.run_id})
 
             marker = "\u2605 BEST" if improved else ""
             tqdm.write(
