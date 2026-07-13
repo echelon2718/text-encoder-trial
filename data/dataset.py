@@ -114,17 +114,20 @@ class AugmentDataset(Dataset):
                 self.dataset = dataset["train"].to_pandas()
             else:
                 self.dataset = pd.read_csv(dataset_path)
-
-                # buang baris yang ada None / NaN di kolom penting
-                required_cols = ["id", "text", "phoneme", "unnormalized_text", "negation"]
-                existing_required_cols = [c for c in required_cols if c in self.dataset.columns]
-                self.dataset = self.dataset.dropna(subset=existing_required_cols)
-
-                # buang data yang cuma 1 kata di kolom text
-                self.dataset = self.dataset[
-                    self.dataset["text"].astype(str).str.split().str.len() > 1
-                ]
-
+            
+            required_cols = ["id", "text", "phoneme", "unnormalized_text", "negation"]
+            existing_required_cols = [c for c in required_cols if c in self.dataset.columns]
+            self.dataset = self.dataset.dropna(subset=existing_required_cols)
+            
+            # normalisasi sentinel: pastikan "kosong" selalu "-", bukan None/NaN/""
+            for col in ["unnormalized_text", "negation"]:
+                if col in self.dataset.columns:
+                    self.dataset[col] = self.dataset[col].fillna("-")
+                    self.dataset.loc[self.dataset[col].astype(str).str.strip() == "", col] = "-"
+            
+            self.dataset = self.dataset[
+                self.dataset["text"].astype(str).str.split().str.len() > 1
+            ]
             self.dataset = self.dataset.reset_index(drop=True)
 
         if "phoneme_negation" not in self.dataset.columns:
