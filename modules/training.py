@@ -147,11 +147,16 @@ class Trainer:
         n_samples_seen = 0
 
         for step, batch in enumerate(pbar):
-            losses, _ = train_step(
-                self.model, self.optimizer, batch, self.criterion, self.n_core, self.n_pneg,
-                self.device, use_amp=self.use_amp,
-                amp_dtype=self.amp_dtype, grad_clip=self.grad_clip, canon_type=self.canon_type,
-            )
+            try:
+                losses, _ = train_step(
+                    self.model, self.optimizer, batch, self.criterion, self.n_core, self.n_pneg,
+                    self.device, use_amp=self.use_amp,
+                    amp_dtype=self.amp_dtype, grad_clip=self.grad_clip, canon_type=self.canon_type,
+                )
+            except Exception as e:
+                tqdm.write(f"[Trainer] step {self.global_step} gagal ({e!r}), skip batch ini.")
+                self.optimizer.zero_grad(set_to_none=True)
+                continue
             if lr_scheduler is not None:
                 lr_scheduler.step()
 
