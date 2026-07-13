@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+from torch.utils.checkpoint import checkpoint
 from modules.utils import length_to_mask
 
 def sinusoidal_PE(length: int, d_model: int, device=None) -> torch.Tensor:
@@ -67,10 +68,16 @@ class TransformerEncoder(nn.Module):
             TransformerEncoderLayer(d_model, n_heads, d_ff, dropout)
             for _ in range(n_layers)
         ])
-    
+        self.gradient_checkpointing = False  # toggle via model.set_gradient_checkpointing(True)
+
     def forward(self, h: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         for layer in self.layers:
-            h = layer(h, mask=mask)
+            if self.gradient_checkpointing and self.training and h.requires_grad:
+                # Recompute activations during backward instead of storing them.
+                # use_reentrant=False is the modern, recommended checkpoint mode.
+                h = checkpoint(layer, h, mask, use_reentrant=False)
+            else:
+                h = layer(h, mask=mask)
         return h
 
 class TransformerDecoderLayer(nn.Module):
@@ -105,15 +112,15 @@ class TransformerDecoderLayer(nn.Module):
         self_kpm = ~query_mask if query_mask is not None else None
         attn_out, _ = self.self_attn(q_canon, q_canon, q_canon, key_padding_mask=self_kpm, need_weights=False)
         q_canon = self.norm1(q_canon + self.dropout1(attn_out))
- 
+
         cross_kpm = ~source_mask if source_mask is not None else None
         cross_out, _ = self.cross_attn(q_canon, z, z, key_padding_mask=cross_kpm, need_weights=False)
         q_canon = self.norm2(q_canon + self.dropout2(cross_out))
- 
+
         ffn_out = self.ffn(q_canon)
         q_canon = self.norm3(q_canon + self.dropout3(ffn_out))
         return q_canon
-        
+
 class TransformerDecoder(nn.Module):
     def __init__(
         self,
@@ -131,7 +138,8 @@ class TransformerDecoder(nn.Module):
             for _ in range(n_layers)
         ])
         self.canonical_query_library = nn.Embedding(num_embeddings=max_length, embedding_dim=d_model)
-    
+        self.gradient_checkpointing = False  # toggle via model.set_gradient_checkpointing(True)
+
     def forward( # CEK LAGI COK BAGIAN INI SALAH, MASK PADDING QUERY SALAH!
         self,
         z: torch.Tensor, # B, L, d_model SATU VIEW
@@ -152,15 +160,20 @@ class TransformerDecoder(nn.Module):
         pe = pe.unsqueeze(0).expand(B, -1, -1).clone() # broadcast to batch size lah
 
         query_canonical = query_canonical + pe
- 
+
         query_mask = length_to_mask(l_star, l_star_max)  # (B, L*_max) bool
         query_canonical = query_canonical * query_mask.unsqueeze(-1)
- 
+
         for layer in self.layers:
-            query_canonical = layer(z, query_canonical, query_mask=query_mask, source_mask=source_mask)
+            if self.gradient_checkpointing and self.training and query_canonical.requires_grad:
+                query_canonical = checkpoint(
+                    layer, z, query_canonical, query_mask, source_mask, use_reentrant=False
+                )
+            else:
+                query_canonical = layer(z, query_canonical, query_mask=query_mask, source_mask=source_mask)
 
         return query_canonical, query_mask
-    
+
 class MaskedAttentionPooling(nn.Module):
     def __init__(self, d_model, hidden: int = 128):
         super(MaskedAttentionPooling, self).__init__()
@@ -169,7 +182,7 @@ class MaskedAttentionPooling(nn.Module):
             nn.Tanh(),
             nn.Linear(hidden, 1)
         )
-    
+
     def forward(self, z: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         logits = self.score(z).squeeze(-1)
         logits = logits.masked_fill(~mask, float("-inf"))
@@ -189,11 +202,11 @@ class LengthPredictor(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden // 2, 1),
         )
-    
+
     def forward(self, z: torch.Tensor, mask: torch.Tensor, detach_input: bool = True) -> tuple[torch.Tensor, torch.Tensor]:
         if detach_input:
             z = z.detach()
-        
+
         pooled = self.pool(z, mask)
 
         lengths = mask.sum(dim=1).float().clamp(min=1.0)
@@ -204,9 +217,9 @@ class LengthPredictor(nn.Module):
 
         l_pred = F.softplus(raw) + self.eps
         log_l_pred = torch.log(l_pred)
-        
+
         return l_pred, log_l_pred
-    
+
 class TLeJEPA(nn.Module):
     def __init__(
         self,
@@ -226,58 +239,83 @@ class TLeJEPA(nn.Module):
         self.encoder = TransformerEncoder(d_model = d_model, n_heads = n_attn_heads, d_ff = 4 * d_model, n_layers = enc_layers, dropout = dropout)
         self.decoder = TransformerDecoder(d_model = d_model, n_heads = n_attn_heads, d_ff = 4 * d_model, n_layers = dec_layers, max_length = max_length, dropout = dropout)
         self.length_predictor = LengthPredictor(d_model = d_model)
-    
+
+    def set_gradient_checkpointing(self, enabled: bool = True):
+        """Trade ~20-30% extra compute for a big cut in activation memory.
+        Recomputes each encoder/decoder layer's activations during backward
+        instead of keeping them all resident -- this is what lets you push
+        batch_size (and therefore the SIGReg/semantic population size) up
+        without OOM. Call once after construction, e.g.:
+            model = TLeJEPA(...)
+            model.set_gradient_checkpointing(True)
+        """
+        self.encoder.gradient_checkpointing = enabled
+        self.decoder.gradient_checkpointing = enabled
+        return self
+
     def _embed(self, ids: torch.Tensor, use_phoneme: bool) -> torch.Tensor:
         emb = self.phoneme_embedding(ids) if use_phoneme else self.text_embedding(ids)
         pe = sinusoidal_PE(ids.shape[1], self.d_model, device = ids.device)
         return emb + pe.unsqueeze(0)
-    
+
     def train_forward(self, x: dict, type: str = "phoneme") -> dict:
         assert type in ("phoneme", "text"), "type must be either text or phoneme"
         use_phoneme = (type == "phoneme")
-        # 1. ENCODE JADI Z1, Z2, ..., ZV
-        # 1.1. Encode view utama dulu
-        mask_1   = x["mask"][:, 0, :] # mask untuk padding di view utama (view pertama)
-        h0_1     = self._embed(x["x"][:, 0, :], use_phoneme=use_phoneme) # embedding + positional encoding untuk view utama
-        z_1      = self.encoder(h=h0_1, mask=mask_1)
-        l_1      = mask_1.sum(dim=1).float().clamp(min=1.0)
-        l_1_pred, _ = self.length_predictor(z_1, mask_1)
-    
-        n_views_aug = x["x"].shape[1] - 1
-        zs, masks, l_preds, l_gt = [], [], [], []
 
-        # 1.2. Encode view yang lain
-        for i in range(n_views_aug):
-            mask_i   = x["mask"][:, i + 1, :]
-            h0_i     = self._embed(x["x"][:, i + 1, :], use_phoneme=False) # embedding + positional encoding untuk view tambahan
-            z_i      = self.encoder(h=h0_i, mask=mask_i)
-            l_i_pred, _ = self.length_predictor(z_i, mask_i)
-            zs.append(z_i)
-            masks.append(mask_i)
-            l_preds.append(l_i_pred)
-            l_gt.append(l_1)
-        
-        # 1.3. Jadiin satu lewat stack, tujuannya semua view ini termasuk kanonik diterusin ke decoder, jadi decoder tau bentuk kanonik seperti apa.
-        z_v = torch.stack([z_1] + zs, dim = 1) # Kumpulkan z1, z2, ..., zV jadi satu tensor, tidak melupakan maskingnya (B, V, L*, d_model)
-        l_v_preds = torch.stack([l_1_pred] + l_preds, dim=1) # B, V
-        l_v_gts = torch.stack([l_1] + l_gt, dim=1) # B, V
-        masks = torch.stack([mask_1] + masks, dim=1) # B, V, L*
+        B, V, L = x["x"].shape
+        n_views_aug = V - 1
 
-        l_stars = l_v_gts[:, 0] # B, skalar, panjang dari view pertama (view utama), teacher forcing
-        # print("DEBUG masks:\n", masks.sum(dim=-1), masks.shape)
+        # 1. EMBED semua view. View kanonik (indeks 0) pakai `use_phoneme` sesuai argumen `type`,
+        #    seluruh view non-kanonik SELALU pakai text_embedding -- SAMA PERSIS dengan versi lama,
+        #    cuma sekarang embedding-nya digabung jadi satu tensor (B, V, L, d) sebelum masuk encoder,
+        #    bukan di-embed dan di-encode satu-satu per view lewat Python loop.
+        h0_canon = self._embed(x["x"][:, 0, :], use_phoneme=use_phoneme)  # (B, L, d)
+        if n_views_aug > 0:
+            aug_ids = x["x"][:, 1:, :].reshape(B * n_views_aug, L)        # (B*(V-1), L)
+            h0_aug = self._embed(aug_ids, use_phoneme=False)              # (B*(V-1), L, d)
+            h0_aug = h0_aug.view(B, n_views_aug, L, self.d_model)         # (B, V-1, L, d)
+            h0 = torch.cat([h0_canon.unsqueeze(1), h0_aug], dim=1)        # (B, V, L, d)
+        else:
+            h0 = h0_canon.unsqueeze(1)                                    # (B, 1, L, d)
 
-        # 2. DECODE JADI ZC1, ZC2, ..., ZCV. Semua view dari kanonik sampai non-kanonik diteruskan ke decoder, buat prediksi gimana bentuk asli kanoniknya. Disini tantangan bagi decoder adalah gimana cara supaya memastikan dia konsisten, menerima bentuk kanonik, dan tidak mengubahnya.
-        z_canon, masks_canon = [], []
-        for i in range(n_views_aug + 1):
-            z_i = z_v[:, i, :, :]
-            mask_i = masks[:, i, :] # Pakai padding mask dari bentuk kanonik untuk mendukung teacher forcing.
-            # print("Z_i shape:", z_i.shape, ", mask_i shape:", mask_i.shape)
-            z_canon_i, mask_canon_i = self.decoder(z=z_i, l_star=l_stars, source_mask=mask_i)
-            z_canon.append(z_canon_i)
-            masks_canon.append(mask_canon_i)
-        
-        z_v_canon = torch.stack(z_canon, dim=1) # B, V, L*_max, d_model
-        masks_v_canon = torch.stack(masks_canon, dim=1) # B, V, L*_max
+        # x["mask"] dari collate_fn SUDAH berbentuk (B, V, L) dengan urutan view yang sama
+        # (indeks 0 = kanonik, sisanya non-kanonik) -- di versi lama, tensor ini dibongkar per-view
+        # lalu di-stack ulang jadi persis tensor yang sama. Di sini dipakai langsung, tanpa bongkar-pasang.
+        masks = x["mask"]  # (B, V, L)
+
+        # 2. ENCODE seluruh view dalam SATU panggilan encoder (bukan V panggilan terpisah).
+        #    Karena TransformerEncoderLayer memproses tiap baris batch secara independen
+        #    (LayerNorm per-baris, attention dengan key_padding_mask per-baris, tidak ada
+        #    interaksi lintas-baris), hasil untuk tiap (b, v) identik dengan sebelumnya --
+        #    cuma dilakukan sekali secara batched, bukan V kali berurutan.
+        h0_flat = h0.reshape(B * V, L, self.d_model)
+        mask_flat = masks.reshape(B * V, L)
+        z_flat = self.encoder(h=h0_flat, mask=mask_flat)          # (B*V, L, d)
+        z_v = z_flat.view(B, V, L, self.d_model)                   # (B, V, L, d) -- identik dgn z_v versi lama
+
+        # 3. LENGTH PREDICTOR untuk seluruh view sekaligus (sebelumnya juga dipanggil V kali terpisah).
+        l_pred_flat, _ = self.length_predictor(z_flat, mask_flat)  # (B*V,)
+        l_v_preds = l_pred_flat.view(B, V)                          # (B, V)
+
+        l_1 = masks[:, 0, :].sum(dim=1).float().clamp(min=1.0)     # (B,) panjang view kanonik
+        # Di versi lama, l_v_gts = stack([l_1] + [l_1]*n_views_aug) -- semua kolom sama-sama l_1.
+        l_v_gts = l_1.unsqueeze(1).expand(B, V)                     # (B, V)
+
+        l_stars = l_1  # (B,) -- teacher forcing pakai panjang kanonik, identik dgn versi lama
+
+        # 4. DECODE seluruh view dalam SATU panggilan decoder (bukan V panggilan terpisah).
+        #    Di versi lama, `l_star` yang dipakai SELALU l_stars yang sama untuk tiap dari V
+        #    panggilan decoder -- jadi query kanonik & query_mask yang dihasilkan identik di
+        #    tiap panggilan (cuma dihitung ulang V kali secara redundan). Di sini l_stars
+        #    di-repeat_interleave sepanjang V supaya urutannya cocok dengan z_flat/mask_flat
+        #    (b-major, v-minor -- sama seperti urutan torch.stack(..., dim=1) di versi lama).
+        l_star_expanded = l_stars.repeat_interleave(V)              # (B*V,)
+        z_canon_flat, mask_canon_flat = self.decoder(
+            z=z_flat, l_star=l_star_expanded, source_mask=mask_flat
+        )
+        L_star_max = z_canon_flat.shape[1]
+        z_v_canon = z_canon_flat.view(B, V, L_star_max, self.d_model)   # identik dgn z_v_canon versi lama
+        masks_v_canon = mask_canon_flat.view(B, V, L_star_max)          # identik dgn masks_v_canon versi lama
 
         return {
             "z_v": z_v,
@@ -301,9 +339,9 @@ class TLeJEPA(nn.Module):
                 zc, _ = self.decoder(z, l_star, source_mask=None)
                 z_canons.append(zc)
                 l_preds.append(l_star)
-            
+
             return z_canons, l_preds
-        
+
         else:
             dummy_mask = torch.arange(0, text.shape[0], device=text.device) < text.shape[0]
             h = self._embed(text.unsqueeze(0), use_phoneme=use_phoneme)
@@ -311,5 +349,5 @@ class TLeJEPA(nn.Module):
             l_hat, _ = self.length_predictor(z, dummy_mask.unsqueeze(0))
             l_star = l_hat.round().long().clamp(min=1)
             zc, _ = self.decoder(z, l_star, source_mask=None)
-            
+
             return zc, l_star
