@@ -18,26 +18,26 @@ class BatchSampler(Sampler):
 
         self.rng = random.Random(seed)
         self._n = len(df)  # dipakai sebagai offset index mode-negasi
- 
+
         positions = np.arange(self._n)
         singlish_mask = (df["unnormalized_text"] != "-").to_numpy()
         negation_mask = (df["negation"] != "-").to_numpy() & ~singlish_mask  # hindari overlap
- 
+
         self.singlish_idx = positions[singlish_mask].tolist()
         self.negation_idx = positions[negation_mask].tolist()
         special_mask = singlish_mask | negation_mask
         self.regular_idx = positions[~special_mask].tolist()
- 
+
         assert len(self.singlish_idx) >= self.n_singlish
         assert len(self.negation_idx) >= self.n_negation
         assert len(self.regular_idx) >= self.n_regular
- 
+
         self.n_batches = self._n // batch_size if drop_last else -(-self._n // batch_size)
- 
+
         self._regular_cycle = self._make_cycle(self.regular_idx)
         self._singlish_cycle = self._make_cycle(self.singlish_idx)
         self._negation_cycle = self._make_cycle(self.negation_idx)
-    
+
     def _make_cycle(self, pool: list):
         pool = list(pool)
         while True:
@@ -45,7 +45,7 @@ class BatchSampler(Sampler):
             self.rng.shuffle(shuffled)
             for i in shuffled:
                 yield i
-    
+
     def _draw_unique(self, cycle_gen, k: int, exclude: set) -> list:
         picked = []
         while len(picked) < k:
@@ -62,18 +62,18 @@ class BatchSampler(Sampler):
                 self._negation_cycle, self.n_negation, exclude=set(regular) | set(singlish)
             )
             negation_twins = [i + self._n for i in negation]  # dispatch ke mode-negasi di __getitem__
- 
+
             yield regular + singlish + negation + negation_twins
-    
+
     def __len__(self):
         return self.n_batches
 
 def collate_fn(batch, pad_value=0):
     max_len = max(seq.shape[0] for sample in batch for seq in sample["x"]) + 2
- 
+
     batch_x = []
     batch_mask = []
- 
+
     for sample in batch:
         padded = []
         masks = []
@@ -81,14 +81,14 @@ def collate_fn(batch, pad_value=0):
             seq = F.pad(seq, (1, 1), value=pad_value)
             seq = F.pad(seq, (0, max_len - len(seq)), value=pad_value)
             padded.append(seq)
- 
+
             m = torch.ones(l + 2, dtype=torch.bool)
             m = F.pad(m, (0, max_len - len(m)), value=False)
             masks.append(m)
- 
+
         batch_x.append(torch.stack(padded))
         batch_mask.append(torch.stack(masks))
- 
+
     return {
         "id": [b["id"] for b in batch],
         "x": torch.stack(batch_x),
@@ -114,6 +114,16 @@ class AugmentDataset(Dataset):
                 self.dataset = dataset["train"].to_pandas()
             else:
                 self.dataset = pd.read_csv(dataset_path)
+
+                # buang baris yang ada None / NaN di kolom penting
+                required_cols = ["id", "text", "phoneme", "unnormalized_text", "negation"]
+                existing_required_cols = [c for c in required_cols if c in self.dataset.columns]
+                self.dataset = self.dataset.dropna(subset=existing_required_cols)
+
+                # buang data yang cuma 1 kata di kolom text
+                self.dataset = self.dataset[
+                    self.dataset["text"].astype(str).str.split().str.len() > 1
+                ]
 
             self.dataset = self.dataset.reset_index(drop=True)
 
