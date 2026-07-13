@@ -45,11 +45,11 @@ def train_step(model, optimizer, batch, criterions, n_core, n_negation, device,
     return losses, out
 
 @torch.no_grad()
-def eval_step(model, batch, criterions, device,
+def eval_step(model, batch, criterions, n_core, n_negation, device,
               use_amp=True, amp_dtype=torch.bfloat16, canon_type: str = "phoneme"):
     model.eval()
     total, losses, out, _ = compute_losses(
-        model, batch, criterions, device,
+        model, batch, criterions, n_core, n_negation, device,
         use_amp=use_amp, amp_dtype=amp_dtype, canon_type=canon_type
     )
     losses["total"] = total.detach()
@@ -192,7 +192,7 @@ class Trainer:
  
         for batch in pbar:
             losses, _ = eval_step(
-                self.model, batch, self.criterion,
+                self.model, batch, self.criterion, self.n_core, self.n_pneg,
                 self.device, use_amp=self.use_amp,
                 amp_dtype=self.amp_dtype, canon_type=self.canon_type,
             )
@@ -335,7 +335,7 @@ class Trainer:
         z_c, m_c = out["z_v_canon"], out["masks_v_canon"]
         B, V = z_c.shape[0], z_c.shape[1]
  
-        teacher_sim = self.criterion.cossim_fn(batch)
+        teacher_sim = self.criterion.cossim_fn(batch, n_core=self.n_core, negation_offset=self.n_core - self.n_pneg, n_negation=self.n_pneg)
  
         pooled = masked_mean(z_c, m_c)
         pooled_norm = F.normalize(pooled, dim=-1)
