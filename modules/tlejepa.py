@@ -293,7 +293,7 @@ class TLeJEPA(nn.Module):
         if type(text) == list:
             z_canons, l_preds = [], []
             for t in text:
-                dummy_mask = torch.arange(0, t.shape[0]) < t.shape[0]
+                dummy_mask = torch.arange(0, t.shape[0], device=t.device) < t.shape[0]
                 h = self._embed(t.unsqueeze(0), use_phoneme=use_phoneme)
                 z = self.encoder(h, mask=None)
                 l_hat, _ = self.length_predictor(z, dummy_mask.unsqueeze(0))
