@@ -68,8 +68,9 @@ class BatchSampler(Sampler):
     def __len__(self):
         return self.n_batches
 
-def collate_fn(batch, pad_value=0):
-    max_len = max(seq.shape[0] for sample in batch for seq in sample["x"]) + 2
+def collate_fn(batch, pad_value=0, max_seq_len: int = 4094):
+    natural_max = max(seq.shape[0] for sample in batch for seq in sample["x"])
+    max_len = min(natural_max, max_seq_len) + 2
 
     batch_x = []
     batch_mask = []
@@ -78,11 +79,13 @@ def collate_fn(batch, pad_value=0):
         padded = []
         masks = []
         for seq, l in zip(sample["x"], sample["x_lengths"]):
+            l_capped = min(l, max_seq_len)
+            seq = seq[:l_capped]
             seq = F.pad(seq, (1, 1), value=pad_value)
             seq = F.pad(seq, (0, max_len - len(seq)), value=pad_value)
             padded.append(seq)
 
-            m = torch.ones(l + 2, dtype=torch.bool)
+            m = torch.ones(l_capped + 2, dtype=torch.bool)
             m = F.pad(m, (0, max_len - len(m)), value=False)
             masks.append(m)
 
@@ -114,17 +117,17 @@ class AugmentDataset(Dataset):
                 self.dataset = dataset["train"].to_pandas()
             else:
                 self.dataset = pd.read_csv(dataset_path)
-            
+
             required_cols = ["id", "text", "phoneme", "unnormalized_text", "negation"]
             existing_required_cols = [c for c in required_cols if c in self.dataset.columns]
             self.dataset = self.dataset.dropna(subset=existing_required_cols)
-            
+
             # normalisasi sentinel: pastikan "kosong" selalu "-", bukan None/NaN/""
             for col in ["unnormalized_text", "negation"]:
                 if col in self.dataset.columns:
                     self.dataset[col] = self.dataset[col].fillna("-")
                     self.dataset.loc[self.dataset[col].astype(str).str.strip() == "", col] = "-"
-            
+
             self.dataset = self.dataset[
                 self.dataset["text"].astype(str).str.split().str.len() > 1
             ]
