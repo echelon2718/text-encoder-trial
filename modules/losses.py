@@ -86,7 +86,7 @@ class CachedSemanticTeacherSimilarity(nn.Module):
             if hasattr(self.base_teacher.teacher_semantic_model, "parameters")
             else torch.device("cpu")
         )
-    
+
         missing_idx = [i for i, _id in enumerate(ids) if _id not in self._cache]
         local_lookup = {}
         if missing_idx:
@@ -98,11 +98,11 @@ class CachedSemanticTeacherSimilarity(nn.Module):
                 local_lookup[ids[global_i]] = emb_i          # selalu tersedia utk batch ini
                 if len(self._cache) < self._cache_size:
                     self._cache[ids[global_i]] = emb_i         # persist hanya kalau masih ada slot
-    
+
         emb = torch.stack([
             self._cache.get(_id, local_lookup.get(_id)) for _id in ids
         ]).to(device)
-    
+
         emb_A = emb[:n_core]
         emb_B = torch.cat([emb[:negation_offset], emb[n_core:n_core + n_negation]], dim=0)
         return emb_A @ emb_B.t()
@@ -174,24 +174,24 @@ def sigreg_loss(out: dict, sigreg_fn: "SIGReg") -> torch.Tensor:
     z_v, masks = out['z_v'], out['masks']          # (B, V, L*, d), (B, V, L*)
     pooled = masked_mean(z_v, masks)                # (B, V, d) -- SATU vektor per kalimat per view
     return sigreg_fn(pooled.transpose(0, 1))        # -> (V, B, d): N=B jadi populasi
-    
+
 def compute_losses(model, batch, criterion, n_core, n_negation, device, use_amp: bool = True, amp_dtype=torch.bfloat16, canon_type: str = "phoneme"):
     batch = move_batch_to_device(batch, device)
- 
+
     autocast_enabled = use_amp and device.type == "cuda"
     with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=autocast_enabled):
         out = model.train_forward(batch, type=canon_type)
- 
+
         l_syn = syntactical_loss(out)
         l_sem = semantic_loss(batch, out, criterion.cossim_fn, n_core=n_core, negation_offset=n_core - n_negation, n_negation=n_negation) # notes, n_core is batch size
         l_sig = sigreg_loss(out, criterion.sigreg_fn)
         l_len = canon_len_loss(out)
- 
+
         canonical_embedding_obj = l_syn + criterion.beta_ * l_sem
         total = (1 - criterion.lambda_) * canonical_embedding_obj \
             + criterion.lambda_ * l_sig \
             + criterion.canon_len_weight * l_len
- 
+
     losses = {
         "total": total,
         "syntactic": l_syn.detach(),
@@ -208,7 +208,7 @@ class TLeJEPACriterion:
     lambda_: float = 0.5
     beta_: float = 1.0
     canon_len_weight: float = 1.0
- 
+
     def to(self, device):
         self.sigreg_fn = self.sigreg_fn.to(device)
         self.cossim_fn = self.cossim_fn.to(device)
