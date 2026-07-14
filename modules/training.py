@@ -100,6 +100,7 @@ class Trainer:
         grad_clip: Optional[float] = 1.0,
         canon_type: str = "phoneme",
         log_every_n_steps: int = 20,
+        save_every_n_steps: int = 1000,
         visualize_every_n_epochs: int = 1,
         n_vis_projection_dirs: int = 3,
         n_vis_samples: int = 6,
@@ -135,6 +136,7 @@ class Trainer:
         self.grad_clip = grad_clip
         self.canon_type = canon_type
         self.log_every_n_steps = log_every_n_steps
+        self.save_every_n_steps = save_every_n_steps
         self.visualize_every_n_epochs = visualize_every_n_epochs
         self.n_vis_samples = n_vis_samples
         self.n_core = n_core
@@ -207,6 +209,19 @@ class Trainer:
                 self.writer.add_scalar("perf/samples_per_sec", samples_per_sec, self.global_step)
 
             self.global_step += 1
+
+            # --- Checkpoint per-iterasi ---------------------------------------
+            # Simpan setiap `save_every_n_steps` step (default 1000), terpisah
+            # dari checkpoint akhir-epoch. Nama file di-overwrite (bukan
+            # per-step unik) supaya tidak membengkak; ini murni jaring pengaman
+            # kalau training crash/disconnect di tengah epoch yang panjang.
+            if self.save_every_n_steps and self.global_step % self.save_every_n_steps == 0:
+                save_model(
+                    os.path.join(self.ckpt_dir, "latest_step.pt"),
+                    self.model, self.optimizer, epoch, self.best_val_loss,
+                    extra={"run_id": self.run_id, "global_step": self.global_step},
+                )
+                tqdm.write(f"[Trainer] Checkpoint tersimpan di step {self.global_step} (epoch {epoch}).")
 
         pbar.close()
         return {k: float(np.mean(v)) for k, v in running.items()}
@@ -414,10 +429,12 @@ class Trainer:
                            self.model, self.optimizer, epoch, self.best_val_loss,
                            extra={"run_id": self.run_id})
 
-            if epoch % save_every_n_epochs == 0:
-                save_model(os.path.join(self.ckpt_dir, "latest_model.pt"),
-                           self.model, self.optimizer, epoch, self.best_val_loss,
-                           extra={"run_id": self.run_id})
+            # Selalu simpan checkpoint di akhir tiap epoch (tidak lagi
+            # bergantung pada save_every_n_epochs) supaya training bisa
+            # di-resume dari epoch manapun kalau tiba-tiba crash/disconnect.
+            save_model(os.path.join(self.ckpt_dir, "latest_model.pt"),
+                       self.model, self.optimizer, epoch, self.best_val_loss,
+                       extra={"run_id": self.run_id})
 
             marker = "\u2605 BEST" if improved else ""
             tqdm.write(
