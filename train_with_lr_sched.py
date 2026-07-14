@@ -21,6 +21,7 @@ def get_args():
     parser.add_argument("--lexicon-path", type=str, default="./lexicon/abbrev-lexicon.json")
     parser.add_argument("--dataset-path", type=str, default="./data/english_singlish_g2p.csv")
     parser.add_argument("--dataset-mode", type=str, default="huggingface", choices=["local", "huggingface"])
+    parser.add_argument("--run-label", type=str, default="run")
 
     parser.add_argument("--train-ratio", type=float, default=0.9)
     parser.add_argument("--batch-size", type=int, default=6)
@@ -194,6 +195,7 @@ def main(args):
         n_singlish=args.n_singlish,
         n_premise_and_negation=args.n_premise_and_negation,
         device=torch.device(args.device),
+        label=args.run_label,
     )
 
     trainer.fit(
