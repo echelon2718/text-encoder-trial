@@ -68,7 +68,8 @@ class BatchSampler(Sampler):
     def __len__(self):
         return self.n_batches
 
-def collate_fn(batch, pad_value=0, max_seq_len: int = 4094):
+def collate_fn(batch, pad_value=0, max_seq_len: int = 4096):
+    max_seq_len = max_seq_len - 2
     natural_max = max(seq.shape[0] for sample in batch for seq in sample["x"])
     max_len = min(natural_max, max_seq_len) + 2
 
