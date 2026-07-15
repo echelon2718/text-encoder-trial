@@ -1,27 +1,65 @@
 import torch
 from torch.utils.data import Dataset, Sampler
 import torch.nn.functional as F
-import pandas as pd
 from data.augmenter import RuleBasedAugmentor
 from data.tokenizer import PhonemeTokenizer
-from datasets import load_dataset
+from datasets import load_dataset, Dataset as HFDataset
 from typing import Optional
 import random
 import numpy as np
 
+
+_REQUIRED_COLS = ["id", "text", "phoneme", "unnormalized_text", "negation"]
+
+
+def _load_and_clean(mode: str, dataset_path: Optional[str]) -> HFDataset:
+    if mode == "huggingface":
+        raw = load_dataset("avalonai/english-singlish-g2p")["train"]
+    else:
+        raw = load_dataset("csv", data_files=dataset_path)["train"]
+
+    existing_required_cols = [c for c in _REQUIRED_COLS if c in raw.column_names]
+
+    if existing_required_cols:
+        raw = raw.filter(
+            lambda ex: all(ex[c] is not None for c in existing_required_cols),
+            desc="Membuang baris dengan kolom wajib null",
+        )
+
+    sentinel_cols = [c for c in ["unnormalized_text", "negation"] if c in raw.column_names]
+    if sentinel_cols:
+        def _fill_sentinel(example):
+            for col in sentinel_cols:
+                v = example[col]
+                if v is None or str(v).strip() == "":
+                    example[col] = "-"
+            return example
+        raw = raw.map(_fill_sentinel, desc="Normalisasi sentinel '-'")
+
+    raw = raw.filter(
+        lambda ex: len(str(ex["text"]).split()) > 1,
+        desc="Membuang kalimat <=1 kata",
+    )
+
+    return raw
+
+
 class BatchSampler(Sampler):
-    def __init__(self, df, batch_size: int = 64, n_singlish_per_batch: int = 2, n_negation_per_batch: int = 2, seed: int = 42, drop_last: bool = True):
+    def __init__(self, dataset: HFDataset, batch_size: int = 64, n_singlish_per_batch: int = 2,
+                 n_negation_per_batch: int = 2, seed: int = 42, drop_last: bool = True):
         self.n_singlish = n_singlish_per_batch
         self.n_negation = n_negation_per_batch
         self.n_regular = batch_size - n_singlish_per_batch - n_negation_per_batch
         assert self.n_regular >= 0, "Kuota singlish + negation melebihi batch size"
 
         self.rng = random.Random(seed)
-        self._n = len(df)  # dipakai sebagai offset index mode-negasi
+        self._n = len(dataset)  # dipakai sebagai offset index mode-negasi
 
         positions = np.arange(self._n)
-        singlish_mask = (df["unnormalized_text"] != "-").to_numpy()
-        negation_mask = (df["negation"] != "-").to_numpy() & ~singlish_mask  # hindari overlap
+        unnorm = np.array(dataset["unnormalized_text"], dtype=object)
+        neg = np.array(dataset["negation"], dtype=object)
+        singlish_mask = unnorm != "-"
+        negation_mask = (neg != "-") & ~singlish_mask  # hindari overlap
 
         self.singlish_idx = positions[singlish_mask].tolist()
         self.negation_idx = positions[negation_mask].tolist()
@@ -68,6 +106,7 @@ class BatchSampler(Sampler):
     def __len__(self):
         return self.n_batches
 
+
 def collate_fn(batch, pad_value=0, max_seq_len: int = 4096):
     max_seq_len = max_seq_len - 2
     natural_max = max(seq.shape[0] for sample in batch for seq in sample["x"])
@@ -101,46 +140,30 @@ def collate_fn(batch, pad_value=0, max_seq_len: int = 4096):
         "mask": torch.stack(batch_mask),
     }
 
+
 class AugmentDataset(Dataset):
     def __init__(
         self,
         lexicon_path: str,
         dataset_path: Optional[str] = None,
         mode: str = "huggingface",
-        dataframe: Optional[pd.DataFrame] = None,
+        hf_dataset: Optional[HFDataset] = None,
         tokenizer: Optional[PhonemeTokenizer] = None,
     ):
-        if dataframe is not None:
-            self.dataset = dataframe.reset_index(drop=True).copy()
+        if hf_dataset is not None:
+            self.dataset = hf_dataset
         else:
-            if mode == "huggingface":
-                dataset = load_dataset("avalonai/english-singlish-g2p")
-                self.dataset = dataset["train"].to_pandas()
-            else:
-                self.dataset = pd.read_csv(dataset_path)
+            self.dataset = _load_and_clean(mode, dataset_path)
 
-            required_cols = ["id", "text", "phoneme", "unnormalized_text", "negation"]
-            existing_required_cols = [c for c in required_cols if c in self.dataset.columns]
-            self.dataset = self.dataset.dropna(subset=existing_required_cols)
-
-            # normalisasi sentinel: pastikan "kosong" selalu "-", bukan None/NaN/""
-            for col in ["unnormalized_text", "negation"]:
-                if col in self.dataset.columns:
-                    self.dataset[col] = self.dataset[col].fillna("-")
-                    self.dataset.loc[self.dataset[col].astype(str).str.strip() == "", col] = "-"
-
-            self.dataset = self.dataset[
-                self.dataset["text"].astype(str).str.split().str.len() > 1
-            ]
-            self.dataset = self.dataset.reset_index(drop=True)
-
-        if "phoneme_negation" not in self.dataset.columns:
-            self.dataset["phoneme_negation"] = "-"
+        if "phoneme_negation" not in self.dataset.column_names:
+            self.dataset = self.dataset.add_column(
+                "phoneme_negation", ["-"] * len(self.dataset)
+            )
 
         self.augmenter = RuleBasedAugmentor(lexicon_path=lexicon_path)
 
         if tokenizer is None:
-            self.phoneme_tokenizer = PhonemeTokenizer.from_corpus(self.dataset["phoneme"].tolist())
+            self.phoneme_tokenizer = PhonemeTokenizer.from_corpus(self.dataset["phoneme"])
         else:
             self.phoneme_tokenizer = tokenizer
 
@@ -163,14 +186,14 @@ class AugmentDataset(Dataset):
         )
 
         if idx < self._n:
-            data = self.dataset.iloc[idx]
+            data = self.dataset[idx]  # dict kecil, transient -- bukan seluruh tabel
             text = data["text"]
             phoneme = data["phoneme"]
             unnormalized_text = data["unnormalized_text"]
             data_id = data["id"]
         else:
             base_idx = idx - self._n
-            data = self.dataset.iloc[base_idx]
+            data = self.dataset[base_idx]
             assert data["negation"] != "-", (
                 f"Baris {base_idx} tidak berlabel negasi, tidak valid diakses lewat idx negasi ({idx})"
             )
