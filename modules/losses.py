@@ -12,50 +12,26 @@ def canon_len_loss(out: dict) -> torch.Tensor:
     loss = F.mse_loss(torch.log1p(l_v_preds), torch.log1p(l_v_gts))
     return loss
 
-#def syntactical_loss(out: dict) -> torch.Tensor:
-#    z_v = out['z_v']
-#    z_v_canon = out['z_v_canon']
-#    masks_v_canon = out['masks_v_canon']
-#
-#    B, V = z_v.shape[0], z_v.shape[1]
-#    L_star_max = z_v_canon.shape[2]
-#
-#    z_target = z_v[:, 0, :L_star_max, :].detach()
-#    mask = masks_v_canon[:, 0, :].unsqueeze(-1).float()
-#
-#    z_target_masked = z_target * mask
-#
-#    loss = 0.0
-#    for v in range(V):
-#        z_canon_v = z_v_canon[:, v, :, :] * mask
-#        loss = loss + F.mse_loss(z_canon_v, z_target_masked, reduction='sum')
-#
-#    return loss / (B * V)
-
 def syntactical_loss(out):
-    z_v = out["z_v"]                # (B, V, L0, D)
-    z_canon = out["z_v_canon"]      # (B, V, L*, D)
-    masks = out["masks_v_canon"]    # (B, V, L*)  bool / float
+    z_v = out["z_v"]
+    z_canon = out["z_v_canon"]
+    masks = out["masks_v_canon"]
 
-    # pastikan semua sejajar di panjang yang sama
+    B, V = z_canon.shape[0], z_canon.shape[1]
     L = min(z_v.size(2), z_canon.size(2), masks.size(2))
-    z_target = z_v[:, 0, :L, :].detach()          # (B, L, D)
-    z_canon = z_canon[:, :, :L, :]                # (B, V, L, D)
-    masks = masks[:, :, :L].float()               # (B, V, L)
 
-    # broadcast target ke semua view
-    target = z_target.unsqueeze(1)                # (B, 1, L, D)
+    z_target = z_v[:, 0, :L, :].detach()
+    mask = masks[:, 0, :L].unsqueeze(-1).float()   # identik utk semua v (teacher forcing)
+    z_target_masked = z_target * mask
 
-    # MSE per-elemen, tanpa loop Python
-    mse = F.mse_loss(z_canon, target.expand_as(z_canon), reduction="none")  # (B, V, L, D)
+    denom = (mask.sum() * z_canon.size(-1) * V).clamp(min=1.0)
 
-    # mask padding
-    mse = mse * masks.unsqueeze(-1)               # (B, V, L, D)
+    loss = 0.0
+    for v in range(V):
+        z_canon_v = z_canon[:, v, :L, :] * mask
+        loss = loss + F.mse_loss(z_canon_v, z_target_masked, reduction='sum')
 
-    # normalisasi hanya pada token valid
-    denom = masks.sum().clamp(min=1.0) * z_canon.size(-1)
-
-    return mse.sum() / denom
+    return loss / denom
 
 def masked_mean(z: torch.Tensor, mask: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     mask_f = mask.unsqueeze(-1).float()
