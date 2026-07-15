@@ -5,7 +5,7 @@ from torch.utils.data import DataLoader
 
 from data.dataset import AugmentDataset, BatchSampler, collate_fn
 from modules.tlejepa import TLeJEPA
-from modules.training import Trainer
+from modules.training import Trainer, find_latest_run_dir
 from modules.losses import (
     TLeJEPACriterion,
     SIGReg,
@@ -22,6 +22,10 @@ def get_args():
     parser.add_argument("--dataset-path", type=str, default="./data/english_singlish_g2p.csv")
     parser.add_argument("--dataset-mode", type=str, default="huggingface", choices=["local", "huggingface"])
     parser.add_argument("--run-label", type=str, default="run")
+    parser.add_argument("--ckpt-root", type=str, default="checkpoints")
+    parser.add_argument("--resume", action="store_true",
+                         help="Lanjutkan dari checkpoint TERBARU utk --run-label ini di --ckpt-root "
+                              "(cari otomatis: latest_step.pt > latest_model.pt > best_model.pt)")
 
     parser.add_argument("--train-ratio", type=float, default=0.9)
     parser.add_argument("--batch-size", type=int, default=6)
@@ -39,7 +43,8 @@ def get_args():
 
     parser.add_argument("--num-slices", type=int, default=1024)
     parser.add_argument("--lambda_", type=float, default=0.5)
-    parser.add_argument("--beta_", type=float, default=0.1)
+    parser.add_argument("--zeta1", type=float, default=1)
+    parser.add_argument("--zeta2", type=float, default=0.1)
 
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--beta1", type=float, default=0.9)
@@ -78,6 +83,22 @@ def build_lr_scheduler(optimizer, total_steps: int, warmup_ratio: float = 0.05, 
 
 
 def main(args):
+    resume_dir = None
+    if args.resume:
+        resume_dir = find_latest_run_dir(args.ckpt_root, args.run_label)
+        if resume_dir is None:
+            raise FileNotFoundError(
+                f"--resume dipakai tapi tidak ada folder checkpoint utk --run-label='{args.run_label}' "
+                f"di dalam '{args.ckpt_root}'. Cek lagi nama label atau path --ckpt-root."
+            )
+        print(f"[main] Ditemukan checkpoint terbaru utk '{args.run_label}': {resume_dir}")
+        print(
+            "[main] PENTING: pastikan semua argumen arsitektur model "
+            "(--d-model, --heads, --enc-layers, --dec-layers, dst) dan --epochs "
+            "SAMA PERSIS dengan run aslinya, kalau tidak state_dict/LR schedule "
+            "tidak akan cocok."
+        )
+
     full_dataset = AugmentDataset(
         lexicon_path=args.lexicon_path,
         dataset_path=args.dataset_path,
@@ -167,7 +188,8 @@ def main(args):
             SemanticTeacherSimilarity()
         ),
         lambda_=args.lambda_,
-        beta_=args.beta_,
+        zeta_1=args.zeta1,
+        zeta_2=args.zeta2,
     )
 
     optimizer = torch.optim.AdamW(
@@ -196,11 +218,21 @@ def main(args):
         n_premise_and_negation=args.n_premise_and_negation,
         device=torch.device(args.device),
         label=args.run_label,
+        ckpt_dir=args.ckpt_root,
+        resume_dir=resume_dir,
+        lr_scheduler=lr_scheduler,
     )
 
+    # --epochs = TOTAL epoch yang ditarget (bukan "epoch tambahan di atas yang
+    # sudah jalan"). trainer.resume_epoch == 1 utk run baru, jadi rumus ini
+    # otomatis benar utk kedua kasus (baru maupun resume).
+    remaining_epochs = max(0, args.epochs - (trainer.resume_epoch - 1))
+    if remaining_epochs == 0:
+        print(f"[main] --epochs={args.epochs} sudah tercapai (resume_epoch={trainer.resume_epoch}). Tidak ada yang perlu dijalankan.")
+        return
+
     trainer.fit(
-        num_epochs=args.epochs,
-        lr_scheduler=lr_scheduler,
+        num_epochs=remaining_epochs,
     )
 
 
