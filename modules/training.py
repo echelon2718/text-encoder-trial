@@ -4,6 +4,7 @@ import math
 import numpy as np
 import matplotlib.pyplot as plt
 import os
+import re
 import time
 import uuid
 import datetime
@@ -23,6 +24,45 @@ except ImportError:
 if _HAS_SKLEARN:
     from sklearn.manifold import TSNE
     from sklearn.decomposition import PCA
+
+
+# Format nama folder run: "<label>-<random_id 8 hex>-<HH-MM-SS>_<DD-MM-YYYY>"
+# random_id selalu 8 karakter hex -> dipakai sebagai jangkar parsing supaya
+# label yang mengandung tanda "-" (mis. "no-sigreg") tetap ter-parse benar.
+_RUN_DIR_PATTERN = re.compile(
+    r"^(?P<label>.+)-(?P<random_id>[0-9a-f]{8})-(?P<ts>\d{2}-\d{2}-\d{2}_\d{2}-\d{2}-\d{4})$"
+)
+
+
+def find_latest_run_dir(ckpt_root: str, label: str) -> Optional[str]:
+    """
+    Cari folder checkpoint TERBARU untuk `label` tertentu di dalam `ckpt_root`.
+    Timestamp di-parse jadi datetime asli (bukan string-sort) supaya urutan
+    tanggal/bulan berbeda tetap benar -- format HH-MM-SS_DD-MM-YYYY tidak
+    terurut benar kalau cuma dibandingkan sebagai string lintas tanggal.
+    Return None kalau tidak ada folder yang cocok.
+    """
+    if not os.path.isdir(ckpt_root):
+        return None
+
+    candidates = []
+    for name in os.listdir(ckpt_root):
+        full_path = os.path.join(ckpt_root, name)
+        if not os.path.isdir(full_path):
+            continue
+        m = _RUN_DIR_PATTERN.match(name)
+        if not m or m.group("label") != label:
+            continue
+        try:
+            ts = datetime.datetime.strptime(m.group("ts"), "%H-%M-%S_%d-%m-%Y")
+        except ValueError:
+            continue
+        candidates.append((ts, full_path))
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[0])
+    return candidates[-1][1]
 
 def train_step(model, optimizer, batch, criterions, n_core, n_negation, device,
                use_amp=True, amp_dtype=torch.bfloat16, grad_clip: Optional[float] = 1.0,
@@ -57,7 +97,8 @@ def eval_step(model, batch, criterions, n_core, n_negation, device,
     losses["total"] = total.detach()
     return losses, out
 
-def save_model(path, model, optimizer, epoch, best_metric, scheduler=None, extra: Optional[dict] = None):
+def save_model(path, model, optimizer, epoch, best_metric, scheduler=None,
+                global_step: Optional[int] = None, extra: Optional[dict] = None):
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     ckpt = {
         "epoch": epoch,
@@ -67,8 +108,11 @@ def save_model(path, model, optimizer, epoch, best_metric, scheduler=None, extra
     }
     if scheduler is not None:
         ckpt["scheduler_state_dict"] = scheduler.state_dict()
-    if extra:
-        ckpt["extra"] = extra
+    merged_extra = dict(extra or {})
+    if global_step is not None:
+        merged_extra["global_step"] = global_step
+    if merged_extra:
+        ckpt["extra"] = merged_extra
     torch.save(ckpt, path)
     return path
 
@@ -79,7 +123,8 @@ def load_model(path, model, optimizer=None, scheduler=None, map_location=None):
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
     if scheduler is not None and "scheduler_state_dict" in ckpt:
         scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-    return ckpt.get("epoch", 0), ckpt.get("best_metric", float("inf"))
+    global_step = ckpt.get("extra", {}).get("global_step", 0)
+    return ckpt.get("epoch", 0), ckpt.get("best_metric", float("inf")), global_step
 
 class Trainer:
     def __init__(
@@ -106,30 +151,41 @@ class Trainer:
         n_vis_samples: int = 6,
         seed: int = 42,
         label: str = "run",
+        resume_dir: Optional[str] = None,
+        lr_scheduler=None,
     ):
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-        # --- Identitas unik untuk eksekusi ini ---------------------------------
-        # Supaya beberapa run paralel (parameter beda) tidak saling overwrite
-        # checkpoint/log satu sama lain, setiap instansiasi Trainer men-generate
-        # run_id unik sekali di awal: "<label>-<random_id>-<HH:mm:SS DD/MM/YYYY>"
         self.label = label
-        self.random_id = uuid.uuid4().hex[:8]
-        self._run_timestamp = datetime.datetime.now().strftime("%H:%M:%S %d/%m/%Y")
-        self.run_id = f"{self.label}-{self.random_id}-{self._run_timestamp}"
-        print(f"Executing training ID: {self.random_id}")
 
-        # ':' dan '/' tidak valid sebagai nama file/folder di banyak filesystem
-        # (khususnya Windows), jadi dipakai versi "aman" khusus untuk path.
-        self._run_id_safe = (
-            self.run_id.replace("/", "-").replace(":", "-").replace(" ", "_")
-        )
+        if resume_dir is not None:
+            # --- Lanjutkan run yang sudah ada -- JANGAN bikin folder baru ------
+            # Supaya checkpoint & log TensorBoard nyambung di tempat yang sama,
+            # bukan folder baru dengan random_id/timestamp baru.
+            self._run_id_safe = os.path.basename(os.path.normpath(resume_dir))
+            self.run_id = self._run_id_safe
+            print(f"[Trainer] Resume dari direktori: {resume_dir}")
+        else:
+            # --- Identitas unik untuk eksekusi baru --------------------------
+            # Supaya beberapa run paralel (parameter beda) tidak saling overwrite
+            # checkpoint/log satu sama lain: "<label>-<random_id>-<HH:mm:SS DD/MM/YYYY>"
+            self.random_id = uuid.uuid4().hex[:8]
+            self._run_timestamp = datetime.datetime.now().strftime("%H:%M:%S %d/%m/%Y")
+            self.run_id = f"{self.label}-{self.random_id}-{self._run_timestamp}"
+            print(f"Executing training ID: {self.random_id}")
+            # ':' dan '/' tidak valid sebagai nama file/folder di banyak filesystem
+            # (khususnya Windows), jadi dipakai versi "aman" khusus untuk path.
+            self._run_id_safe = (
+                self.run_id.replace("/", "-").replace(":", "-").replace(" ", "_")
+            )
 
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.model = model.to(self.device)
         self.optimizer = optimizer
         self.criterion = criterion.to(self.device)
+        # Disimpan di sini (bukan cuma parameter fit()) supaya state scheduler
+        # bisa ikut di-load saat resume, dan ikut di-checkpoint tiap save.
+        self.lr_scheduler = lr_scheduler
 
         self.use_amp = use_amp
         self.amp_dtype = amp_dtype
@@ -144,16 +200,23 @@ class Trainer:
         self.n_pneg = n_premise_and_negation
 
         # Checkpoint tiap run disimpan di subfolder sendiri: <ckpt_dir>/<run_id>/...
-        self.ckpt_dir = os.path.join(ckpt_dir, self._run_id_safe)
+        self.ckpt_dir = resume_dir if resume_dir is not None else os.path.join(ckpt_dir, self._run_id_safe)
         os.makedirs(self.ckpt_dir, exist_ok=True)
 
-        # Log TensorBoard juga dipisah per run, dengan alasan yang sama.
+        # Log TensorBoard juga dipisah per run -- kalau resume, nama dir sama
+        # persis dengan sebelumnya, jadi TensorBoard menyambung di grafik yang
+        # sama (bukan grafik baru terpisah).
         run_log_dir = os.path.join(log_dir, self._run_id_safe)
         self.writer = SummaryWriter(log_dir=run_log_dir)
-        self.writer.add_text("run_info/run_id", self.run_id, global_step=0)
 
         self.global_step = 0
         self.best_val_loss = float("inf")
+        self.resume_epoch = 1  # dipakai sbg default start_epoch di fit()
+
+        if resume_dir is not None:
+            self.resume_epoch = self._load_resume_checkpoint(resume_dir)
+        else:
+            self.writer.add_text("run_info/run_id", self.run_id, global_step=0)
 
         self._vis_batch = next(iter(self.val_loader))
 
@@ -162,7 +225,55 @@ class Trainer:
         directions = torch.randn(d_model, n_vis_projection_dirs, generator=g)
         self._fixed_directions = (directions / directions.norm(dim=0, keepdim=True)).to(self.device)
 
+    def _load_resume_checkpoint(self, resume_dir: str) -> int:
+        """
+        Prioritas file yang dimuat:
+          1. latest_step.pt  -- checkpoint per-1000-step, termasuk progres
+             mid-epoch kalau training crash di tengah jalan.
+          2. latest_model.pt -- akhir epoch terakhir yang selesai PENUH.
+          3. best_model.pt   -- fallback terakhir kalau dua di atas tidak ada.
+
+        Return start_epoch yang seharusnya dipakai:
+          - dari latest_step.pt -> epoch YANG SAMA (redo dari awal epoch itu;
+            kita tidak menyimpan posisi persis di tengah epoch, jadi paling
+            aman ulang epoch itu dari awal dengan bobot model yang sudah ada)
+          - dari latest_model.pt / best_model.pt -> epoch + 1 (epoch itu
+            sudah selesai penuh, lanjut ke epoch berikutnya)
+        """
+        step_ckpt = os.path.join(resume_dir, "latest_step.pt")
+        epoch_ckpt = os.path.join(resume_dir, "latest_model.pt")
+        best_ckpt = os.path.join(resume_dir, "best_model.pt")
+
+        if os.path.exists(step_ckpt):
+            path, redo_same_epoch = step_ckpt, True
+        elif os.path.exists(epoch_ckpt):
+            path, redo_same_epoch = epoch_ckpt, False
+        elif os.path.exists(best_ckpt):
+            path, redo_same_epoch = best_ckpt, False
+        else:
+            raise FileNotFoundError(f"Tidak ada checkpoint (.pt) ditemukan di {resume_dir}")
+
+        epoch, best_metric, global_step = load_model(
+            path, self.model, optimizer=self.optimizer,
+            scheduler=self.lr_scheduler, map_location=self.device,
+        )
+        self.best_val_loss = best_metric
+        self.global_step = global_step
+        print(
+            f"[Trainer] Dimuat dari {path}: epoch={epoch}, global_step={global_step}, "
+            f"best_val_loss={best_metric:.4f}"
+        )
+        self.writer.add_text(
+            "run_info/resumed_from",
+            f"Resumed from `{os.path.basename(path)}` at epoch={epoch}, global_step={global_step}",
+            global_step=global_step,
+        )
+        return epoch if redo_same_epoch else epoch + 1
+
     def train(self, epoch: int, lr_scheduler=None):
+        if lr_scheduler is not None:
+            self.lr_scheduler = lr_scheduler  # utk kompatibilitas panggilan lama
+
         self.model.train()
         running = {}
         n_batches = len(self.train_loader)
@@ -179,12 +290,28 @@ class Trainer:
                     self.device, use_amp=self.use_amp,
                     amp_dtype=self.amp_dtype, grad_clip=self.grad_clip, canon_type=self.canon_type,
                 )
+            except RuntimeError as e:
+                is_oom = "out of memory" in str(e).lower()
+                self.optimizer.zero_grad(set_to_none=True)
+                if is_oom and torch.cuda.is_available():
+                    allocated = torch.cuda.memory_allocated(self.device) / 1e9
+                    reserved = torch.cuda.memory_reserved(self.device) / 1e9
+                    tqdm.write(
+                        f"[Trainer] OOM di step {self.global_step} "
+                        f"(allocated={allocated:.2f}GB reserved={reserved:.2f}GB). "
+                        f"Membersihkan cache & skip batch ini."
+                    )
+                    del e
+                    torch.cuda.empty_cache()
+                else:
+                    tqdm.write(f"[Trainer] RuntimeError di step {self.global_step} ({e!r}), skip batch ini.")
+                continue
             except Exception as e:
                 tqdm.write(f"[Trainer] step {self.global_step} gagal ({e!r}), skip batch ini.")
                 self.optimizer.zero_grad(set_to_none=True)
                 continue
-            if lr_scheduler is not None:
-                lr_scheduler.step()
+            if self.lr_scheduler is not None:
+                self.lr_scheduler.step()
 
             n_samples_seen += batch["x"].shape[0]
             elapsed = max(time.time() - t_start, 1e-8)
@@ -219,7 +346,9 @@ class Trainer:
                 save_model(
                     os.path.join(self.ckpt_dir, "latest_step.pt"),
                     self.model, self.optimizer, epoch, self.best_val_loss,
-                    extra={"run_id": self.run_id, "global_step": self.global_step},
+                    scheduler=self.lr_scheduler,
+                    global_step=self.global_step,
+                    extra={"run_id": self.run_id},
                 )
                 tqdm.write(f"[Trainer] Checkpoint tersimpan di step {self.global_step} (epoch {epoch}).")
 
@@ -413,12 +542,19 @@ class Trainer:
         )
         self.writer.add_text("semantic_diagnostics/legend_teks", table, global_step=epoch)
 
-    def fit(self, num_epochs: int, lr_scheduler=None, start_epoch: int = 1,
+    def fit(self, num_epochs: int, lr_scheduler=None, start_epoch: Optional[int] = None,
             save_every_n_epochs: int = 1):
+        if lr_scheduler is not None:
+            self.lr_scheduler = lr_scheduler
+        if start_epoch is None:
+            # Otomatis lanjut dari epoch yang benar kalau resume_dir dipakai
+            # di konstruktor; kalau run baru, self.resume_epoch == 1.
+            start_epoch = self.resume_epoch
+
         epoch_bar = tqdm(range(start_epoch, start_epoch + num_epochs), desc="Total progress",
                           colour="magenta", dynamic_ncols=True)
         for epoch in epoch_bar:
-            train_loss = self.train(epoch, lr_scheduler=lr_scheduler)
+            train_loss = self.train(epoch)
             val_loss = self.eval()
             self.log_to_tensorboard(epoch, train_loss, val_loss)
 
@@ -427,6 +563,7 @@ class Trainer:
                 self.best_val_loss = val_loss["total"]
                 save_model(os.path.join(self.ckpt_dir, "best_model.pt"),
                            self.model, self.optimizer, epoch, self.best_val_loss,
+                           scheduler=self.lr_scheduler, global_step=self.global_step,
                            extra={"run_id": self.run_id})
 
             # Selalu simpan checkpoint di akhir tiap epoch (tidak lagi
@@ -434,6 +571,7 @@ class Trainer:
             # di-resume dari epoch manapun kalau tiba-tiba crash/disconnect.
             save_model(os.path.join(self.ckpt_dir, "latest_model.pt"),
                        self.model, self.optimizer, epoch, self.best_val_loss,
+                       scheduler=self.lr_scheduler, global_step=self.global_step,
                        extra={"run_id": self.run_id})
 
             marker = "\u2605 BEST" if improved else ""
