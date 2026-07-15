@@ -114,23 +114,33 @@ def main(args):
     train_idx = perm[:train_size]
     val_idx = perm[train_size:]
 
-    train_df = full_dataset.dataset.iloc[train_idx].reset_index(drop=True)
-    val_df = full_dataset.dataset.iloc[val_idx].reset_index(drop=True)
+    # `.select()` (bukan pandas `.iloc`) -- tetap Arrow-backed & di-cache ke
+    # disk oleh library `datasets`, jadi aman di-share lintas worker DataLoader
+    # tanpa memori dobel-dobel.
+    train_hf = full_dataset.dataset.select(train_idx)
+    val_hf = full_dataset.dataset.select(val_idx)
+    shared_tokenizer = full_dataset.phoneme_tokenizer
+
+    # full_dataset (dataset penuh) sudah tidak dibutuhkan lagi setelah ini --
+    # dilepas eksplisit supaya tidak nyimpen copy dataset yang nganggur
+    # sepanjang training (sebelumnya ini jadi salah satu sumber pemakaian
+    # RAM host yang tidak perlu).
+    del full_dataset
 
     train_dataset = AugmentDataset(
         lexicon_path=args.lexicon_path,
-        dataframe=train_df,
-        tokenizer=full_dataset.phoneme_tokenizer,
+        hf_dataset=train_hf,
+        tokenizer=shared_tokenizer,
     )
 
     val_dataset = AugmentDataset(
         lexicon_path=args.lexicon_path,
-        dataframe=val_df,
-        tokenizer=full_dataset.phoneme_tokenizer,
+        hf_dataset=val_hf,
+        tokenizer=shared_tokenizer,
     )
 
     train_sampler = BatchSampler(
-        df=train_dataset.dataset,
+        dataset=train_dataset.dataset,
         batch_size=args.batch_size,
         n_singlish_per_batch=args.n_singlish,
         n_negation_per_batch=args.n_premise_and_negation,
@@ -139,7 +149,7 @@ def main(args):
     )
 
     val_sampler = BatchSampler(
-        df=val_dataset.dataset,
+        dataset=val_dataset.dataset,
         batch_size=args.batch_size,
         n_singlish_per_batch=args.n_singlish,
         n_negation_per_batch=args.n_premise_and_negation,
@@ -172,7 +182,7 @@ def main(args):
 
     model = TLeJEPA(
         n_vocab_text=256,
-        n_vocab_phoneme=full_dataset.phoneme_tokenizer.vocab_size,
+        n_vocab_phoneme=shared_tokenizer.vocab_size,
         d_model=args.d_model,
         n_attn_heads=args.heads,
         enc_layers=args.enc_layers,
