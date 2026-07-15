@@ -2,7 +2,7 @@ import argparse
 import math
 import torch
 from torch.utils.data import DataLoader
-
+from functools import partial
 from data.dataset import AugmentDataset, BatchSampler, collate_fn
 from modules.tlejepa import TLeJEPA
 from modules.training import Trainer, find_latest_run_dir
@@ -156,7 +156,7 @@ def main(args):
         train_dataset,
         batch_sampler=train_sampler,
         num_workers=args.num_workers,
-        collate_fn=collate_fn,
+        collate_fn=partial(collate_fn, max_seq_len=args.max_length),
         pin_memory=True,
         **loader_extra_kwargs,
     )
@@ -165,7 +165,7 @@ def main(args):
         val_dataset,
         batch_sampler=val_sampler,
         num_workers=args.num_workers,
-        collate_fn=collate_fn,
+        collate_fn=partial(collate_fn, max_seq_len=args.max_length),
         pin_memory=True,
         **loader_extra_kwargs,
     )
