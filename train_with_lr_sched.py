@@ -11,6 +11,7 @@ from modules.losses import (
     SIGReg,
     SemanticTeacherSimilarity,
     CachedSemanticTeacherSimilarity,
+    TeacherMagnitudeProjection,
 )
 
 from modules.utils import core_split
@@ -42,9 +43,20 @@ def get_args():
     parser.add_argument("--dropout", type=float, default=0.1)
 
     parser.add_argument("--num-slices", type=int, default=1024)
-    parser.add_argument("--lambda_", type=float, default=0.5)
+    parser.add_argument("--lambda_", type=float, default=0.6)
     parser.add_argument("--zeta1", type=float, default=1)
     parser.add_argument("--zeta2", type=float, default=0.1)
+    parser.add_argument("--zeta2-neg", type=float, default=1.0,
+                         help="Bobot (l_sem_negation + l_sem_negation_contrast) -- blok negasi murni "
+                              "dari semantic_loss. Ini sinyal negasi UTAMA, jangan dikecilkan.")
+    parser.add_argument("--zeta-mag", type=float, default=0.1,
+                         help="Bobot magnitude_loss (MSE thd embedding teacher MENTAH lewat proj_head). "
+                              "Sengaja kecil (default 0.1, jauh di bawah --zeta2-neg): magnitude_loss "
+                              "berpotensi tarik-menarik dengan SIGReg (keduanya menekan skala/statistik "
+                              "populasi embedding), jadi ini pelengkap sinyal negasi, bukan penentu utama. "
+                              "Pantau losses['magnitude'] mentah dulu sebelum menaikkan ini.")
+    parser.add_argument("--d-teacher", type=int, default=768,
+                         help="Dimensi embedding teacher (NegMPNet = 768) -- target proj_head.")
 
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--beta1", type=float, default=0.9)
@@ -59,6 +71,10 @@ def get_args():
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--visualize-every-n-steps", type=int, default=1000,
+                         help="Log diagnostik visual (t-SNE, histogram SIGReg, heatmap semantik) "
+                              "ke TensorBoard tiap N step -- TIDAK menunggu 1 epoch selesai. "
+                              "Set 0 untuk matikan (cuma logging di akhir epoch, perilaku lama).")
 
     return parser.parse_args()
 
@@ -197,13 +213,16 @@ def main(args):
         cossim_fn=CachedSemanticTeacherSimilarity(
             SemanticTeacherSimilarity()
         ),
+        proj_head=TeacherMagnitudeProjection(d_model=args.d_model, d_teacher=args.d_teacher),
         lambda_=args.lambda_,
         zeta_1=args.zeta1,
         zeta_2=args.zeta2,
+        zeta_2_neg=args.zeta2_neg,
+        zeta_mag=args.zeta_mag,
     )
 
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        list(model.parameters()) + list(criterion.proj_head.parameters()),
         lr=args.lr,
         betas=(args.beta1, args.beta2),
     )
@@ -231,6 +250,7 @@ def main(args):
         ckpt_dir=args.ckpt_root,
         resume_dir=resume_dir,
         lr_scheduler=lr_scheduler,
+        visualize_every_n_steps=(args.visualize_every_n_steps or None),
     )
 
     # --epochs = TOTAL epoch yang ditarget (bukan "epoch tambahan di atas yang
