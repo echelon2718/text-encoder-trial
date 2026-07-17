@@ -120,7 +120,7 @@ def semantic_loss(
     n_core: int = 64,
     negation_offset: int = 62,
     n_negation: int = 2,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     z_c = out['z_v_canon']       # (B_total, V, L, d), B_total = n_core + n_negation (mis. 66)
     m_c = out['masks_v_canon']
 
@@ -145,10 +145,45 @@ def semantic_loss(
     assert teacher_sim.shape == (n_core, n_core), (
         f"teacher_sim harus ({n_core},{n_core}), didapat {tuple(teacher_sim.shape)}"
     )
+    teacher_sim = teacher_sim.to(sim_all.device)
 
-    D = sim_all - teacher_sim.view(n_core, n_core, 1, 1).to(sim_all.device)
-    delta = D.pow(2).sum(dim=(-2, -1))
-    return delta.sum() / (n_core ** 2)
+    D = sim_all - teacher_sim.view(n_core, n_core, 1, 1)
+    delta = D.pow(2).sum(dim=(-2, -1))          # (n_core, n_core) -- error per pasangan teks (i, j)
+
+    # --- BLOK negasi murni: HANYA baris premis (negation_offset:n_core)
+    # x kolom negation-twin (negation_offset:n_core). Baris LAIN yang
+    # kebetulan dibandingkan ke kolom negasi (mis. kalimat regular vs
+    # negation-twin milik premis lain) BUKAN sinyal negasi -- itu cuma
+    # pasangan tak berkaitan biasa, jadi masuk grup general.
+    neg_block_mask = torch.zeros(n_core, n_core, dtype=torch.bool, device=delta.device)
+    if negation_offset < n_core:
+        neg_block_mask[negation_offset:n_core, negation_offset:n_core] = True
+
+    n_gen_entries = (~neg_block_mask).sum().clamp(min=1)
+    n_neg_entries = neg_block_mask.sum().clamp(min=1)
+
+    l_sem_general = delta[~neg_block_mask].sum() / n_gen_entries
+    l_sem_negation = delta[neg_block_mask].sum() / n_neg_entries
+
+    # --- kontras: Delta(p_i) = sim(p_i, n_i) - rata2 SISA n_core-1 kolom
+    # pada baris premis yang sama (leave-one-out atas baris i itu sendiri)
+    l_sem_negation_contrast = torch.zeros((), device=delta.device, dtype=delta.dtype)
+    if negation_offset < n_core and n_core > 1:
+        sim_canon = sim_all[:, :, 0, 0]              # (n_core, n_core), slice kanonik student
+        premise_rows = torch.arange(negation_offset, n_core, device=delta.device)   # (n_negation,)
+        denom = float(n_core - 1)
+
+        teacher_diag = teacher_sim[premise_rows, premise_rows]                       # (n_negation,)
+        teacher_baseline = (teacher_sim[premise_rows].sum(dim=1) - teacher_diag) / denom
+        teacher_contrast = (teacher_diag - teacher_baseline).detach()                 # (n_negation,)
+
+        student_diag = sim_canon[premise_rows, premise_rows]                          # (n_negation,)
+        student_baseline = (sim_canon[premise_rows].sum(dim=1) - student_diag) / denom
+        student_contrast = student_diag - student_baseline
+
+        l_sem_negation_contrast = F.mse_loss(student_contrast, teacher_contrast)
+
+    return l_sem_general, l_sem_negation, l_sem_negation_contrast
 
 class SIGReg(nn.Module):
     def __init__(self, knots: int = 17, num_slices: int = 256, t_max: float = 3.0):
@@ -184,11 +219,23 @@ def compute_losses(model, batch, criterion, n_core, n_negation, device, use_amp:
         out = model.train_forward(batch, type=canon_type)
 
         l_syn = syntactical_loss(out)
-        l_sem = semantic_loss(batch, out, criterion.cossim_fn, n_core=n_core, negation_offset=n_core - n_negation, n_negation=n_negation) # notes, n_core is batch size
+        l_sem_general, l_sem_negation, l_sem_negation_contrast = semantic_loss(
+            batch, out, criterion.cossim_fn,
+            n_core=n_core, negation_offset=n_core - n_negation, n_negation=n_negation,
+        )  # notes, n_core is batch size
         l_sig = sigreg_loss(out, criterion.sigreg_fn)
         l_len = canon_len_loss(out)
 
-        canonical_embedding_obj = criterion.zeta_1 * l_syn + criterion.zeta_2 * l_sem
+        # l_sem_negation (absolut) dan l_sem_negation_contrast (relatif thd
+        # baseline anchor) digabung dulu sebelum dikali zeta_2_neg -- supaya
+        # cuma SATU knob baru yang perlu Anda tuning, bukan tiga.
+        l_sem_negation_combined = l_sem_negation + l_sem_negation_contrast
+
+        canonical_embedding_obj = (
+            criterion.zeta_1 * l_syn
+            + criterion.zeta_2 * l_sem_general
+            + criterion.zeta_2_neg * l_sem_negation_combined
+        )
         total = (1 - criterion.lambda_) * canonical_embedding_obj \
             + criterion.lambda_ * l_sig \
             + criterion.canon_len_weight * l_len
@@ -196,7 +243,11 @@ def compute_losses(model, batch, criterion, n_core, n_negation, device, use_amp:
     losses = {
         "total": total,
         "syntactic": l_syn.detach(),
-        "semantic": l_sem.detach(),
+        # kompat: kode logging lama (mis. training.py) masih baca losses["semantic"]
+        "semantic": (l_sem_general + l_sem_negation_combined).detach(),
+        "semantic_general": l_sem_general.detach(),
+        "semantic_negation": l_sem_negation.detach(),
+        "semantic_negation_contrast": l_sem_negation_contrast.detach(),
         "sigreg": l_sig.detach(),
         "canon_len": l_len.detach(),
     }
@@ -209,6 +260,7 @@ class TLeJEPACriterion:
     lambda_: float = 0.5
     zeta_1: float = 1.0
     zeta_2: float = 1.0
+    zeta_2_neg: float = 1.0  # bobot terpisah utk (l_sem_negation + l_sem_negation_contrast)
     canon_len_weight: float = 1.0
 
     def to(self, device):
