@@ -44,6 +44,12 @@ class SemanticTeacherSimilarity(nn.Module):
         super().__init__()
         self.teacher_semantic_model = SentenceTransformer(teacher_model).eval()
 
+    @torch.no_grad()
+    def _get_raw(self, batch: dict) -> torch.Tensor:
+        canonical_texts = [t[0] for t in batch['texts']]
+        emb = self.teacher_semantic_model.encode(canonical_texts, convert_to_tensor=True)
+        return emb  # MENTAH, belum dinormalisasi -- masih membawa magnitude
+
     def forward(
         self,
         batch: dict,
@@ -51,10 +57,7 @@ class SemanticTeacherSimilarity(nn.Module):
         negation_offset: int = 62,
         n_negation: int = 2,
     ) -> torch.Tensor:
-        canonical_texts = [t[0] for t in batch['texts']]
-        with torch.no_grad():
-            emb = self.teacher_semantic_model.encode(canonical_texts, convert_to_tensor=True)
-        emb = F.normalize(emb, dim=-1, eps=1e-8)
+        emb = F.normalize(self._get_raw(batch), dim=-1, eps=1e-8)
 
         emb_A = emb[:n_core]
         emb_B = torch.cat(
@@ -62,6 +65,10 @@ class SemanticTeacherSimilarity(nn.Module):
             dim=0,
         )
         return emb_A @ emb_B.t()  # (n_core, n_core)
+
+    def get_raw_embeddings(self, batch: dict) -> torch.Tensor:
+        """Dipakai magnitude_loss -- embedding teacher mentah, (B_total, d_teacher)."""
+        return self._get_raw(batch)
 
 
 class CachedSemanticTeacherSimilarity(nn.Module):
@@ -79,7 +86,13 @@ class CachedSemanticTeacherSimilarity(nn.Module):
         return self
 
     @torch.no_grad()
-    def forward(self, batch, n_core=64, negation_offset=62, n_negation=2):
+    def _get_raw(self, batch) -> torch.Tensor:
+        """
+        Cache sekarang menyimpan embedding MENTAH (belum dinormalisasi) --
+        supaya forward() (cosine-sim, normalisasi di sini) dan
+        get_raw_embeddings() (magnitude_loss, butuh skala asli) sama-sama
+        dilayani dari SATU encode() saja, tidak encode dua kali per teks.
+        """
         ids = batch["id"]
         texts = [t[0] for t in batch["texts"]]
         device = (
@@ -93,7 +106,7 @@ class CachedSemanticTeacherSimilarity(nn.Module):
         if missing_idx:
             missing_texts = [texts[i] for i in missing_idx]
             new_embs = self.base_teacher.teacher_semantic_model.encode(missing_texts, convert_to_tensor=True)
-            new_embs = F.normalize(new_embs, dim=-1, eps=1e-8)
+            # TIDAK di-F.normalize di sini lagi -- disimpan mentah.
             for local_i, global_i in enumerate(missing_idx):
                 emb_i = new_embs[local_i].detach().cpu()
                 local_lookup[ids[global_i]] = emb_i          # selalu tersedia utk batch ini
@@ -103,10 +116,19 @@ class CachedSemanticTeacherSimilarity(nn.Module):
         emb = torch.stack([
             self._cache.get(_id, local_lookup.get(_id)) for _id in ids
         ]).to(device)
+        return emb
 
+    @torch.no_grad()
+    def forward(self, batch, n_core=64, negation_offset=62, n_negation=2):
+        emb = F.normalize(self._get_raw(batch), dim=-1, eps=1e-8)
         emb_A = emb[:n_core]
         emb_B = torch.cat([emb[:negation_offset], emb[n_core:n_core + n_negation]], dim=0)
         return emb_A @ emb_B.t()
+
+    @torch.no_grad()
+    def get_raw_embeddings(self, batch) -> torch.Tensor:
+        """Dipakai magnitude_loss -- embedding teacher mentah, (B_total, d_teacher)."""
+        return self._get_raw(batch)
 
     def cache_stats(self) -> dict:
         return {"cached_sentences": len(self._cache)}
@@ -185,6 +207,62 @@ def semantic_loss(
 
     return l_sem_general, l_sem_negation, l_sem_negation_contrast
 
+
+class TeacherMagnitudeProjection(nn.Module):
+    """
+    Proyeksi linear student (d_model) -> ruang embedding teacher (d_teacher).
+    Modul ini SCAFFOLDING MURNI untuk magnitude_loss:
+      - Parameternya WAJIB didaftarkan ke optimizer yang sama dengan model
+        utama (lihat contoh wiring di bawah). Kalau tidak, dia diam di
+        inisialisasi acak dan magnitude_loss justru MERUSAK training --
+        mendorong z_v_canon mengejar output acak yang tidak berarti.
+      - Modul ini BUKAN bagian dari TLeJEPA dan tidak dipakai saat inference.
+        Setelah training selesai, buang saja state_dict-nya (jangan ikut
+        di-load ke model final).
+    """
+    def __init__(self, d_model: int, d_teacher: int = 768):
+        super().__init__()
+        self.proj = nn.Linear(d_model, d_teacher)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.proj(x)
+
+
+def magnitude_loss(
+    batch: dict,
+    out: dict,
+    cossim_fn,
+    proj_head: "TeacherMagnitudeProjection",
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """
+    Regresi MSE langsung per-kalimat (bukan matriks N x N seperti
+    semantic_loss) antara embedding teacher MENTAH (belum dinormalisasi --
+    magnitude-nya masih ada) dan pooled decoder output KANONIK (v=0) student,
+    setelah diproyeksikan ke dimensi teacher lewat proj_head.
+
+    Bedanya dari semantic_loss: semantic_loss pakai cosine similarity (murni
+    sudut, F.normalize dulu di kedua sisi) -- di sini MSE mentah otomatis ikut
+    menghukum selisih PANJANG vektor, bukan cuma selisih arah.
+    """
+    if not hasattr(cossim_fn, "get_raw_embeddings"):
+        raise AttributeError(
+            "cossim_fn butuh method get_raw_embeddings(batch) -> (B_total, d_teacher) "
+            "untuk magnitude_loss. Pastikan pakai SemanticTeacherSimilarity / "
+            "CachedSemanticTeacherSimilarity versi terbaru di file ini."
+        )
+
+    teacher_raw = cossim_fn.get_raw_embeddings(batch).detach()   # (B_total, d_teacher), MENTAH
+
+    z_c = out['z_v_canon']            # (B_total, V, L, d_model)
+    m_c = out['masks_v_canon']
+
+    pooled = masked_mean(z_c[:, 0, :, :], m_c[:, 0, :], eps=eps)   # (B_total, d_model) -- slice kanonik v=0
+    pooled_proj = proj_head(pooled)                                 # (B_total, d_teacher)
+
+    return F.mse_loss(pooled_proj, teacher_raw.to(pooled_proj.device))
+
+
 class SIGReg(nn.Module):
     def __init__(self, knots: int = 17, num_slices: int = 256, t_max: float = 3.0):
         super().__init__()
@@ -223,6 +301,7 @@ def compute_losses(model, batch, criterion, n_core, n_negation, device, use_amp:
             batch, out, criterion.cossim_fn,
             n_core=n_core, negation_offset=n_core - n_negation, n_negation=n_negation,
         )  # notes, n_core is batch size
+        l_mag = magnitude_loss(batch, out, criterion.cossim_fn, criterion.proj_head)
         l_sig = sigreg_loss(out, criterion.sigreg_fn)
         l_len = canon_len_loss(out)
 
@@ -235,6 +314,7 @@ def compute_losses(model, batch, criterion, n_core, n_negation, device, use_amp:
             criterion.zeta_1 * l_syn
             + criterion.zeta_2 * l_sem_general
             + criterion.zeta_2_neg * l_sem_negation_combined
+            + criterion.zeta_mag * l_mag
         )
         total = (1 - criterion.lambda_) * canonical_embedding_obj \
             + criterion.lambda_ * l_sig \
@@ -248,6 +328,7 @@ def compute_losses(model, batch, criterion, n_core, n_negation, device, use_amp:
         "semantic_general": l_sem_general.detach(),
         "semantic_negation": l_sem_negation.detach(),
         "semantic_negation_contrast": l_sem_negation_contrast.detach(),
+        "magnitude": l_mag.detach(),
         "sigreg": l_sig.detach(),
         "canon_len": l_len.detach(),
     }
@@ -257,13 +338,16 @@ def compute_losses(model, batch, criterion, n_core, n_negation, device, use_amp:
 class TLeJEPACriterion:
     sigreg_fn: SIGReg
     cossim_fn: nn.Module
+    proj_head: "TeacherMagnitudeProjection"
     lambda_: float = 0.5
     zeta_1: float = 1.0
     zeta_2: float = 1.0
     zeta_2_neg: float = 1.0  # bobot terpisah utk (l_sem_negation + l_sem_negation_contrast)
+    zeta_mag: float = 1.0    # bobot utk magnitude_loss
     canon_len_weight: float = 1.0
 
     def to(self, device):
         self.sigreg_fn = self.sigreg_fn.to(device)
         self.cossim_fn = self.cossim_fn.to(device)
+        self.proj_head = self.proj_head.to(device)
         return self
