@@ -14,7 +14,7 @@ conda activate avalonai
 
 cd ~/text-encoder-trial
 
-python train_with_lr_sched_continue.py \
+python train_with_lr_sched.py \
   --dataset-mode huggingface \
   --batch-size 28 \
   --num-workers 4 \
@@ -28,4 +28,7 @@ python train_with_lr_sched_continue.py \
   --epochs 1 \
   --zeta1 1.0 \
   --zeta2 1.0 \
+  --zeta2-neg 1.0 \
+  --zeta-mag 0.1 \
+  --d-teacher 768 \
   --run-label base_full_revised_2048 \
