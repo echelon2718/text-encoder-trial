@@ -98,7 +98,7 @@ def eval_step(model, batch, criterions, n_core, n_negation, device,
     return losses, out
 
 def save_model(path, model, optimizer, epoch, best_metric, scheduler=None,
-                global_step: Optional[int] = None, extra: Optional[dict] = None):
+                global_step: Optional[int] = None, extra: Optional[dict] = None, criterion = None):
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     ckpt = {
         "epoch": epoch,
@@ -108,6 +108,12 @@ def save_model(path, model, optimizer, epoch, best_metric, scheduler=None,
     }
     if scheduler is not None:
         ckpt["scheduler_state_dict"] = scheduler.state_dict()
+
+    if criterion is not None and hasattr(criterion, "proj_head"):
+        ckpt["criterion_extra_state_dict"] = {
+            "proj_head": criterion.proj_head.state_dict(),
+        }
+
     merged_extra = dict(extra or {})
     if global_step is not None:
         merged_extra["global_step"] = global_step
@@ -116,13 +122,17 @@ def save_model(path, model, optimizer, epoch, best_metric, scheduler=None,
     torch.save(ckpt, path)
     return path
 
-def load_model(path, model, optimizer=None, scheduler=None, map_location=None):
+def load_model(path, model, optimizer=None, scheduler=None, map_location=None, criterion = None):
     ckpt = torch.load(path, map_location=map_location, weights_only=False)
     model.load_state_dict(ckpt["model_state_dict"])
     if optimizer is not None and "optimizer_state_dict" in ckpt:
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
     if scheduler is not None and "scheduler_state_dict" in ckpt:
         scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+    if criterion is not None and hasattr(criterion, "proj_head"):
+        extra_state = ckpt.get("criterion_extra_state_dict", {})
+        if "proj_head" in extra_state:
+            criterion.proj_head.load_state_dict(extra_state["proj_head"])
     global_step = ckpt.get("extra", {}).get("global_step", 0)
     return ckpt.get("epoch", 0), ckpt.get("best_metric", float("inf")), global_step
 
@@ -147,6 +157,7 @@ class Trainer:
         log_every_n_steps: int = 20,
         save_every_n_steps: int = 1000,
         visualize_every_n_epochs: int = 1,
+        visualize_every_n_steps: Optional[int] = 1000,
         n_vis_projection_dirs: int = 3,
         n_vis_samples: int = 6,
         seed: int = 42,
@@ -194,6 +205,7 @@ class Trainer:
         self.log_every_n_steps = log_every_n_steps
         self.save_every_n_steps = save_every_n_steps
         self.visualize_every_n_epochs = visualize_every_n_epochs
+        self.visualize_every_n_steps = visualize_every_n_steps
         self.n_vis_samples = n_vis_samples
         self.n_core = n_core
         self.n_singlish = n_singlish
@@ -256,6 +268,7 @@ class Trainer:
         epoch, best_metric, global_step = load_model(
             path, self.model, optimizer=self.optimizer,
             scheduler=self.lr_scheduler, map_location=self.device,
+            criterion=self.criterion,
         )
         self.best_val_loss = best_metric
         self.global_step = global_step
@@ -324,6 +337,7 @@ class Trainer:
                 "Loss": f"{float(losses['total']):.4f}",
                 "L_syn": f"{float(losses['syntactic']):.3f}",
                 "L_sem": f"{float(losses['semantic']):.3f}",
+                "L_mag": f"{float(losses['magnitude']):.3f}",
                 "L_SIGReg": f"{float(losses['sigreg']):.3f}",
                 "L_len": f"{float(losses['canon_len']):.3f}",
                 "lr": f"{float(losses['lr']):.2e}",
@@ -337,6 +351,14 @@ class Trainer:
 
             self.global_step += 1
 
+            # --- Diagnostik visual periodik (BUKAN cuma di akhir epoch) -------
+            # Epoch yang butuh berjam-jam/berhari-hari berarti "akhir epoch"
+            # bisa jadi TIDAK PERNAH tercapai (crash/OOM/keburu deadline duluan).
+            # Jadi diagnostik ini juga dipicu tiap N step, supaya tetap ada
+            # sinyal visual di TensorBoard walau training belum lewat 1 epoch.
+            if self.visualize_every_n_steps and self.global_step % self.visualize_every_n_steps == 0:
+                self._log_all_diagnostics(self.global_step)
+
             # --- Checkpoint per-iterasi ---------------------------------------
             # Simpan setiap `save_every_n_steps` step (default 1000), terpisah
             # dari checkpoint akhir-epoch. Nama file di-overwrite (bukan
@@ -349,6 +371,7 @@ class Trainer:
                     scheduler=self.lr_scheduler,
                     global_step=self.global_step,
                     extra={"run_id": self.run_id},
+                    criterion=self.criterion,
                 )
                 tqdm.write(f"[Trainer] Checkpoint tersimpan di step {self.global_step} (epoch {epoch}).")
 
@@ -390,9 +413,36 @@ class Trainer:
             self.writer.add_scalar("epoch/grad_norm", train_loss["grad_norm"], epoch)
 
         if epoch % self.visualize_every_n_epochs == 0:
-            self._log_latent_geometry(epoch)
-            self._log_gaussian_diagnostics(epoch)
-            self._log_similarity_heatmaps(epoch)
+            self._log_all_diagnostics(self.global_step)
+
+    def _log_all_diagnostics(self, step: int):
+        """
+        Jalankan ketiga visualisasi diagnostik (t-SNE latent geometry,
+        histogram Gaussian SIGReg, heatmap similarity semantik) sekali panggil.
+
+        Dipakai dari DUA tempat: (1) periodik tiap `visualize_every_n_steps`
+        di dalam train(), dan (2) di akhir epoch lewat log_to_tensorboard().
+        Keduanya pakai `global_step` (BUKAN nomor epoch) sebagai sumbu-x
+        TensorBoard, supaya titik-titik dari dua sumber ini nyambung jadi
+        satu kurva progres yang sama, bukan saling menimpa di titik yang sama.
+
+        Dibungkus try/except: kalau salah satu visualisasi gagal (mis. TSNE
+        error karena batch vis kebetulan terlalu kecil), training TIDAK ikut
+        crash -- cuma dicatat & dilewati, karena kegagalan berikut sudah
+        cukup mahal (proses ini bisa jalan berjam-jam).
+        """
+        try:
+            self._log_latent_geometry(step)
+        except Exception as e:
+            tqdm.write(f"[Trainer] _log_latent_geometry gagal di step {step}: {e!r}")
+        try:
+            self._log_gaussian_diagnostics(step)
+        except Exception as e:
+            tqdm.write(f"[Trainer] _log_gaussian_diagnostics gagal di step {step}: {e!r}")
+        try:
+            self._log_similarity_heatmaps(step)
+        except Exception as e:
+            tqdm.write(f"[Trainer] _log_similarity_heatmaps gagal di step {step}: {e!r}")
 
     @torch.no_grad()
     def _forward_vis_batch(self):
@@ -404,7 +454,7 @@ class Trainer:
         return batch, out
 
     @torch.no_grad()
-    def _log_latent_geometry(self, epoch: int):
+    def _log_latent_geometry(self, step: int):
         if not _HAS_SKLEARN:
             return
         batch, out = self._forward_vis_batch()
@@ -451,13 +501,13 @@ class Trainer:
             axs[1].scatter(proj_canon[idxs[0], 0], proj_canon[idxs[0], 1],
                             color=color, marker="*", s=280, edgecolor="black", linewidth=0.8)
 
-        axs[0].set_title(f"Ruang Encoder f_theta (sebelum decode) — Epoch {epoch}")
-        axs[1].set_title(f"Ruang Kanonik g_phi (setelah decode) — Epoch {epoch}")
+        axs[0].set_title(f"Ruang Encoder f_theta (sebelum decode) — Step {step}")
+        axs[1].set_title(f"Ruang Kanonik g_phi (setelah decode) — Step {step}")
         for ax in axs:
             ax.set_xlabel("t-SNE dim 1"); ax.set_ylabel("t-SNE dim 2")
         axs[0].legend(loc="best", fontsize=8)
         plt.tight_layout()
-        self.writer.add_figure("latent_geometry/tsne_prior_vs_canon", fig, global_step=epoch)
+        self.writer.add_figure("latent_geometry/tsne_prior_vs_canon", fig, global_step=step)
         plt.close(fig)
 
         legend_md = "| Idx | View | Teks |\n|---|---|---|\n"
@@ -466,10 +516,10 @@ class Trainer:
                 label = "**KANONIK (anchor)**" if v == 0 else f"non-kanonik #{v}"
                 snippet = texts[i][v] if v < len(texts[i]) else ""
                 legend_md += f"| {i} | {label} | {snippet} |\n"
-        self.writer.add_text("latent_geometry/legend_teks", legend_md, global_step=epoch)
+        self.writer.add_text("latent_geometry/legend_teks", legend_md, global_step=step)
 
     @torch.no_grad()
-    def _log_gaussian_diagnostics(self, epoch: int):
+    def _log_gaussian_diagnostics(self, step: int):
         batch, out = self._forward_vis_batch()
         z_v, masks = out["z_v"], out["masks"]
         pooled = masked_mean(z_v, masks)
@@ -490,20 +540,20 @@ class Trainer:
             axs[i].plot(x_axis, gaussian_pdf, color="crimson", linewidth=2, label="Target N(0,1)")
             axs[i].set_title(f"Arah proyeksi acak #{i+1}")
             axs[i].legend(fontsize=8)
-        fig.suptitle(f"Distribusi proyeksi 1-D vs Gaussian standar (efek SIGReg) — Epoch {epoch}")
+        fig.suptitle(f"Distribusi proyeksi 1-D vs Gaussian standar (efek SIGReg) — Step {step}")
         plt.tight_layout()
-        self.writer.add_figure("sigreg_diagnostics/histogram_vs_gaussian", fig, global_step=epoch)
+        self.writer.add_figure("sigreg_diagnostics/histogram_vs_gaussian", fig, global_step=step)
         plt.close(fig)
 
         for i in range(k):
-            self.writer.add_histogram(f"sigreg_diagnostics/projection_dim_{i}", proj[:, i], global_step=epoch)
+            self.writer.add_histogram(f"sigreg_diagnostics/projection_dim_{i}", proj[:, i], global_step=step)
 
         var_per_dim = flat.var(dim=0)
-        self.writer.add_scalar("sigreg_diagnostics/mean_dim_variance", var_per_dim.mean().item(), epoch)
-        self.writer.add_scalar("sigreg_diagnostics/isotropy_std_of_variance", var_per_dim.std().item(), epoch)
+        self.writer.add_scalar("sigreg_diagnostics/mean_dim_variance", var_per_dim.mean().item(), step)
+        self.writer.add_scalar("sigreg_diagnostics/isotropy_std_of_variance", var_per_dim.std().item(), step)
 
     @torch.no_grad()
-    def _log_similarity_heatmaps(self, epoch: int):
+    def _log_similarity_heatmaps(self, step: int):
         batch, out = self._forward_vis_batch()
         z_c, m_c = out["z_v_canon"], out["masks_v_canon"]
         B, V = z_c.shape[0], z_c.shape[1]
@@ -524,7 +574,7 @@ class Trainer:
         plt.colorbar(im0, ax=axs[0], fraction=0.046)
 
         im1 = axs[1].imshow(model_sim.float().cpu().numpy(), cmap="viridis", vmin=-1, vmax=1)
-        axs[1].set_title(f"Model (rata2 semua pasangan view) — Epoch {epoch}")
+        axs[1].set_title(f"Model (rata2 semua pasangan view) — Step {step}")
         plt.colorbar(im1, ax=axs[1], fraction=0.046)
 
         im2 = axs[2].imshow(diff.float().cpu().numpy(), cmap="inferno", vmin=0)
@@ -532,15 +582,15 @@ class Trainer:
         plt.colorbar(im2, ax=axs[2], fraction=0.046)
 
         plt.tight_layout()
-        self.writer.add_figure("semantic_diagnostics/similarity_heatmaps", fig, global_step=epoch)
+        self.writer.add_figure("semantic_diagnostics/similarity_heatmaps", fig, global_step=step)
         plt.close(fig)
-        self.writer.add_scalar("semantic_diagnostics/mean_abs_diff", diff.mean().item(), epoch)
+        self.writer.add_scalar("semantic_diagnostics/mean_abs_diff", diff.mean().item(), step)
 
         canon_texts = [t[0] for t in batch["texts"]]
         table = "| Idx | Kalimat kanonik |\n|---|---|\n" + "\n".join(
             f"| {i} | {txt} |" for i, txt in enumerate(canon_texts)
         )
-        self.writer.add_text("semantic_diagnostics/legend_teks", table, global_step=epoch)
+        self.writer.add_text("semantic_diagnostics/legend_teks", table, global_step=step)
 
     def fit(self, num_epochs: int, lr_scheduler=None, start_epoch: Optional[int] = None,
             save_every_n_epochs: int = 1):
@@ -564,7 +614,7 @@ class Trainer:
                 save_model(os.path.join(self.ckpt_dir, "best_model.pt"),
                            self.model, self.optimizer, epoch, self.best_val_loss,
                            scheduler=self.lr_scheduler, global_step=self.global_step,
-                           extra={"run_id": self.run_id})
+                           extra={"run_id": self.run_id}, criterion=self.criterion)
 
             # Selalu simpan checkpoint di akhir tiap epoch (tidak lagi
             # bergantung pada save_every_n_epochs) supaya training bisa
@@ -572,13 +622,14 @@ class Trainer:
             save_model(os.path.join(self.ckpt_dir, "latest_model.pt"),
                        self.model, self.optimizer, epoch, self.best_val_loss,
                        scheduler=self.lr_scheduler, global_step=self.global_step,
-                       extra={"run_id": self.run_id})
+                       extra={"run_id": self.run_id}, criterion=self.criterion)
 
             marker = "\u2605 BEST" if improved else ""
             tqdm.write(
                 f"[Epoch {epoch:03d}] "
                 f"train_loss={train_loss['total']:.4f} "
                 f"(syn={train_loss['syntactic']:.3f} sem={train_loss['semantic']:.3f} "
+                f"mag={train_loss['magnitude']:.3f} "
                 f"sig={train_loss['sigreg']:.3f} len={train_loss['canon_len']:.3f}) | "
                 f"val_loss={val_loss['total']:.4f} {marker}"
             )
