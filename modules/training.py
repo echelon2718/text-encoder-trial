@@ -73,11 +73,36 @@ def train_step(model, optimizer, batch, criterions, n_core, n_negation, device,
         model, batch, criterions, n_core, n_negation, device,
         use_amp=use_amp, amp_dtype=amp_dtype, canon_type=canon_type
     )
+
+    if not torch.isfinite(total):
+        # Loss NaN/Inf TIDAK boleh di-backward -- optimizer.step() akan
+        # menyuntikkan NaN ke bobot model SECARA PERMANEN kalau dipaksa jalan.
+        losses["total"] = total.detach()
+        losses["grad_norm"] = torch.tensor(0.0)
+        losses["lr"] = torch.tensor(optimizer.param_groups[0]["lr"])
+        losses["_skipped"] = True
+        return losses, out
+
     total.backward()
 
     grad_norm = None
     if grad_clip is not None and grad_clip > 0:
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        # proj_head IKUT di-clip -- sebelumnya cuma model.parameters(),
+        # padahal proj_head ikut dioptimasi optimizer yang sama (lihat
+        # train_with_lr_sched.py) dan menerima gradien MSE tak-scale-invariant
+        # dari magnitude_loss.
+        clip_params = list(model.parameters())
+        if criterions is not None and hasattr(criterions, "proj_head"):
+            clip_params += list(criterions.proj_head.parameters())
+        grad_norm = torch.nn.utils.clip_grad_norm_(clip_params, grad_clip)
+
+    if grad_norm is not None and not torch.isfinite(grad_norm):
+        optimizer.zero_grad(set_to_none=True)
+        losses["total"] = total.detach()
+        losses["grad_norm"] = grad_norm.detach()
+        losses["lr"] = torch.tensor(optimizer.param_groups[0]["lr"])
+        losses["_skipped"] = True
+        return losses, out
 
     optimizer.step()
 
@@ -164,9 +189,18 @@ class Trainer:
         label: str = "run",
         resume_dir: Optional[str] = None,
         lr_scheduler=None,
+        lambda_warmup_steps: Optional[int] = None,
     ):
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.label = label
+        # Nilai target lambda_ (bobot SIGReg) diambil dari criterion SEBELUM
+        # diapa-apakan -- selama warmup, criterion.lambda_ akan dinaikkan
+        # bertahap dari ~0 menuju nilai target ini, supaya sinyal korespondensi
+        # (syntactic/semantic) sempat "menang" dulu di awal training sebelum
+        # SIGReg (yang TERBUKTI buta thd korespondensi -- lihat losses.py)
+        # mulai ikut dominan menarik arah gradien.
+        self._lambda_target = criterion.lambda_
+        self.lambda_warmup_steps = lambda_warmup_steps
 
         if resume_dir is not None:
             # --- Lanjutkan run yang sudah ada -- JANGAN bikin folder baru ------
@@ -297,6 +331,14 @@ class Trainer:
         n_samples_seen = 0
 
         for step, batch in enumerate(pbar):
+            if self.lambda_warmup_steps:
+                # Linear warmup: lambda_ mulai dari ~0 di global_step=0, naik
+                # linear sampai self._lambda_target persis di step ke-N.
+                # SETELAH warmup selesai, lambda_ konstan di nilai target
+                # (perilaku sama seperti sebelum patch ini kalau
+                # lambda_warmup_steps tidak di-set / None).
+                frac = min(1.0, self.global_step / self.lambda_warmup_steps)
+                self.criterion.lambda_ = frac * self._lambda_target
             try:
                 losses, _ = train_step(
                     self.model, self.optimizer, batch, self.criterion, self.n_core, self.n_pneg,
@@ -323,6 +365,14 @@ class Trainer:
                 tqdm.write(f"[Trainer] step {self.global_step} gagal ({e!r}), skip batch ini.")
                 self.optimizer.zero_grad(set_to_none=True)
                 continue
+
+            if losses.get("_skipped"):
+                tqdm.write(
+                    f"[Trainer] Loss/gradien NaN atau Inf di step {self.global_step} -- "
+                    f"batch DIBUANG, bobot model TIDAK diupdate."
+                )
+                continue
+
             if self.lr_scheduler is not None:
                 self.lr_scheduler.step()
 
@@ -340,6 +390,7 @@ class Trainer:
                 "L_mag": f"{float(losses['magnitude']):.3f}",
                 "L_SIGReg": f"{float(losses['sigreg']):.3f}",
                 "L_len": f"{float(losses['canon_len']):.3f}",
+                "lambda": f"{self.criterion.lambda_:.3f}",
                 "lr": f"{float(losses['lr']):.2e}",
                 "Samples/s": f"{samples_per_sec:.1f}",
             })
@@ -348,6 +399,7 @@ class Trainer:
                 for k, v in losses.items():
                     self.writer.add_scalar(f"train_step/{k}", float(v), self.global_step)
                 self.writer.add_scalar("perf/samples_per_sec", samples_per_sec, self.global_step)
+                self.writer.add_scalar("train_step/lambda_current", self.criterion.lambda_, self.global_step)
 
             self.global_step += 1
 
