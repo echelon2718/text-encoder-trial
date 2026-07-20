@@ -43,9 +43,21 @@ def get_args():
     parser.add_argument("--dropout", type=float, default=0.1)
 
     parser.add_argument("--num-slices", type=int, default=1024)
-    parser.add_argument("--lambda_", type=float, default=0.6)
+    parser.add_argument("--lambda_", type=float, default=0.3,
+                         help="Bobot target SIGReg SETELAH warmup. Diturunkan dari default lama (0.6) -- "
+                              "SIGReg terbukti buta terhadap korespondensi antar-contoh (permutation-"
+                              "invariant per view), jadi bobot 60%% terlalu dominan dan menenggelamkan "
+                              "sinyal syntactic/semantic yang justru menjaga korespondensi.")
+    parser.add_argument("--lambda-warmup-steps", type=int, default=8000,
+                         help="Jumlah step utk menaikkan lambda_ linear dari 0 -> --lambda_. "
+                              "Supaya korespondensi (syntactic/semantic) sempat terbentuk dulu SEBELUM "
+                              "SIGReg mulai ikut menekan arah gradien. Set 0 utk matikan (lambda_ konstan "
+                              "sejak step 0, perilaku lama).")
     parser.add_argument("--zeta1", type=float, default=1)
-    parser.add_argument("--zeta2", type=float, default=0.1)
+    parser.add_argument("--zeta2", type=float, default=1.0,
+                         help="Dinaikkan dari default lama (0.1) -- ini satu-satunya sinyal yang menjaga "
+                              "korespondensi PASANGAN (i,j) secara eksplisit, jadi tidak boleh terlalu kecil "
+                              "relatif terhadap syntactic_loss (per-contoh, tanpa sinyal anti-permutasi).")
     parser.add_argument("--zeta2-neg", type=float, default=1.0,
                          help="Bobot (l_sem_negation + l_sem_negation_contrast) -- blok negasi murni "
                               "dari semantic_loss. Ini sinyal negasi UTAMA, jangan dikecilkan.")
@@ -55,6 +67,12 @@ def get_args():
                               "berpotensi tarik-menarik dengan SIGReg (keduanya menekan skala/statistik "
                               "populasi embedding), jadi ini pelengkap sinyal negasi, bukan penentu utama. "
                               "Pantau losses['magnitude'] mentah dulu sebelum menaikkan ini.")
+    parser.add_argument("--sigreg-canon-weight", type=float, default=1.0,
+                         help="Bobot SIGReg utk ruang decoder/kanonik (z_v_canon), TERPISAH dari SIGReg "
+                              "encoder (z_v). z_v_canon adalah tensor yang dipakai syntactic_loss/"
+                              "semantic_loss/magnitude_loss (analog `a_emb` di LeJEPA Algorithm 2), jadi "
+                              "SESUAI resep LeJEPA dia juga wajib diregularisasi SIGReg -- sebelumnya "
+                              "tidak sama sekali. Default 1.0 = bobot setara dengan z_v.")
     parser.add_argument("--d-teacher", type=int, default=768,
                          help="Dimensi embedding teacher (NegMPNet = 768) -- target proj_head.")
 
@@ -219,6 +237,7 @@ def main(args):
         zeta_2=args.zeta2,
         zeta_2_neg=args.zeta2_neg,
         zeta_mag=args.zeta_mag,
+        sigreg_canon_weight=args.sigreg_canon_weight,
     )
 
     optimizer = torch.optim.AdamW(
@@ -251,6 +270,7 @@ def main(args):
         resume_dir=resume_dir,
         lr_scheduler=lr_scheduler,
         visualize_every_n_steps=(args.visualize_every_n_steps or None),
+        lambda_warmup_steps=(args.lambda_warmup_steps or None),
     )
 
     # --epochs = TOTAL epoch yang ditarget (bukan "epoch tambahan di atas yang
