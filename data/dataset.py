@@ -11,8 +11,29 @@ import numpy as np
 
 _REQUIRED_COLS = ["id", "text", "phoneme", "unnormalized_text", "negation"]
 
+# Baris dengan `text` >= ambang ini akan dibuang, KECUALI id-nya berawalan
+# _EXEMPT_ID_PREFIX (mis. korpus Singlish "NUS-*" yang ingin selalu dipertahankan
+# berapa pun panjangnya).
+_MAX_TEXT_CHARS = 512
+_EXEMPT_ID_PREFIX = "NUS"
 
-def _load_and_clean(mode: str, dataset_path: Optional[str]) -> HFDataset:
+
+def _length_filter_batch(ids, texts, max_text_chars: int, exempt_id_prefix: str):
+    keep = []
+    for i, t in zip(ids, texts):
+        if exempt_id_prefix and str(i).startswith(exempt_id_prefix):
+            keep.append(True)
+        else:
+            keep.append(len(str(t)) < max_text_chars)
+    return keep
+
+
+def _load_and_clean(
+    mode: str,
+    dataset_path: Optional[str],
+    max_text_chars: int = _MAX_TEXT_CHARS,
+    exempt_id_prefix: str = _EXEMPT_ID_PREFIX,
+) -> HFDataset:
     if mode == "huggingface":
         raw = load_dataset("avalonai/english-singlish-g2p")["train"]
     else:
@@ -40,6 +61,18 @@ def _load_and_clean(mode: str, dataset_path: Optional[str]) -> HFDataset:
         lambda ex: len(str(ex["text"]).split()) > 1,
         desc="Membuang kalimat <=1 kata",
     )
+
+    if max_text_chars is not None and "id" in raw.column_names and "text" in raw.column_names:
+        raw = raw.filter(
+            lambda batch: _length_filter_batch(
+                batch["id"], batch["text"], max_text_chars, exempt_id_prefix
+            ),
+            batched=True,
+            desc=(
+                f"Membuang teks >={max_text_chars} char "
+                f"(kecuali id berawalan '{exempt_id_prefix}')"
+            ),
+        )
 
     return raw
 
@@ -149,11 +182,15 @@ class AugmentDataset(Dataset):
         mode: str = "huggingface",
         hf_dataset: Optional[HFDataset] = None,
         tokenizer: Optional[PhonemeTokenizer] = None,
+        max_text_chars: Optional[int] = _MAX_TEXT_CHARS,
+        exempt_id_prefix: str = _EXEMPT_ID_PREFIX,
     ):
         if hf_dataset is not None:
             self.dataset = hf_dataset
         else:
-            self.dataset = _load_and_clean(mode, dataset_path)
+            self.dataset = _load_and_clean(
+                mode, dataset_path, max_text_chars=max_text_chars, exempt_id_prefix=exempt_id_prefix
+            )
 
         if "phoneme_negation" not in self.dataset.column_names:
             self.dataset = self.dataset.add_column(
