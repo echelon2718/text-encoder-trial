@@ -492,9 +492,17 @@ class Trainer:
         except Exception as e:
             tqdm.write(f"[Trainer] _log_gaussian_diagnostics gagal di step {step}: {e!r}")
         try:
+            self._log_canon_gaussian_diagnostics(step)
+        except Exception as e:
+            tqdm.write(f"[Trainer] _log_canon_gaussian_diagnostics gagal di step {step}: {e!r}")
+        try:
             self._log_similarity_heatmaps(step)
         except Exception as e:
             tqdm.write(f"[Trainer] _log_similarity_heatmaps gagal di step {step}: {e!r}")
+        try:
+            self._log_grad_norm_decomposition(step)
+        except Exception as e:
+            tqdm.write(f"[Trainer] _log_grad_norm_decomposition gagal di step {step}: {e!r}")
 
     @torch.no_grad()
     def _forward_vis_batch(self):
@@ -605,20 +613,77 @@ class Trainer:
         self.writer.add_scalar("sigreg_diagnostics/isotropy_std_of_variance", var_per_dim.std().item(), step)
 
     @torch.no_grad()
+    def _log_canon_gaussian_diagnostics(self, step: int):
+        """
+        SAMA PERSIS dengan _log_gaussian_diagnostics, tapi utk ruang decoder/
+        kanonik (z_v_canon) -- sebelumnya diagnostik ini CUMA ada utk ruang
+        encoder (z_v), padahal SIGReg sekarang juga menargetkan z_v_canon
+        (lihat sigreg_canon_weight di losses.py). Tanpa panel ini kita buta
+        thd efek eksperimen "SIGReg di ruang decoder" secara terpisah dari
+        efeknya di ruang encoder -- keduanya numpuk jadi satu di
+        sigreg_diagnostics/* yang lama.
+        """
+        batch, out = self._forward_vis_batch()
+        z_c, masks_c = out["z_v_canon"], out["masks_v_canon"]
+        pooled = masked_mean(z_c, masks_c)
+        B, V, d = pooled.shape
+        flat = pooled.reshape(B * V, d).float()
+
+        proj = flat @ self._fixed_directions
+        k = proj.shape[1]
+
+        fig, axs = plt.subplots(1, k, figsize=(4.5 * k, 4))
+        if k == 1:
+            axs = [axs]
+        x_axis = np.linspace(-4, 4, 200)
+        gaussian_pdf = (1.0 / math.sqrt(2 * math.pi)) * np.exp(-x_axis ** 2 / 2)
+        for i in range(k):
+            vals = proj[:, i].detach().cpu().numpy()
+            axs[i].hist(vals, bins=30, density=True, alpha=0.6, color="darkorange", label="Proyeksi empiris")
+            axs[i].plot(x_axis, gaussian_pdf, color="crimson", linewidth=2, label="Target N(0,1)")
+            axs[i].set_title(f"Arah proyeksi acak #{i+1} (kanonik)")
+            axs[i].legend(fontsize=8)
+        fig.suptitle(f"Distribusi proyeksi 1-D vs Gaussian standar, ruang KANONIK — Step {step}")
+        plt.tight_layout()
+        self.writer.add_figure("sigreg_diagnostics_canon/histogram_vs_gaussian", fig, global_step=step)
+        plt.close(fig)
+
+        var_per_dim = flat.var(dim=0)
+        self.writer.add_scalar("sigreg_diagnostics_canon/mean_dim_variance", var_per_dim.mean().item(), step)
+        self.writer.add_scalar("sigreg_diagnostics_canon/isotropy_std_of_variance", var_per_dim.std().item(), step)
+
+    @torch.no_grad()
     def _log_similarity_heatmaps(self, step: int):
         batch, out = self._forward_vis_batch()
         z_c, m_c = out["z_v_canon"], out["masks_v_canon"]
-        B, V = z_c.shape[0], z_c.shape[1]
+        V = z_c.shape[1]
 
         teacher_sim = self.criterion.cossim_fn(batch, n_core=self.n_core, negation_offset=self.n_core - self.n_pneg, n_negation=self.n_pneg)
 
-        pooled = masked_mean(z_c, m_c)
+        # z_c juga membawa baris "negation_twin" tambahan di luar n_core (lihat
+        # BatchSampler.__iter__ di data/dataset.py -- batch penuh = n_core +
+        # n_negation twin rows). teacher_sim cuma didefinisikan utk (n_core,
+        # n_core) pertama, jadi model_sim WAJIB dipotong ke n_core baris yang
+        # sama -- sebelumnya dipakai B penuh (z_c.shape[0]) di sini, yang
+        # bikin shape model_sim != shape teacher_sim dan method ini gagal diam-
+        # diam tiap kali dipanggil (ketutup try/except di _log_all_diagnostics).
+        B = self.n_core
+        pooled = masked_mean(z_c[:B], m_c[:B])
         pooled_norm = F.normalize(pooled, dim=-1)
         flat = pooled_norm.reshape(B * V, -1)
         sim_all = (flat @ flat.t()).view(B, V, B, V).permute(0, 2, 1, 3)
         model_sim = sim_all.mean(dim=(2, 3))
 
         diff = (model_sim - teacher_sim).abs()
+
+        # Skalar "seberapa collapse" yang langsung terbaca: rata2 cosine
+        # similarity ANTAR contoh yang BERBEDA (bukan diagonal). Kalau ini
+        # naik terus mendekati 1 (model) sementara teacher_offdiag tetap
+        # jauh di bawahnya, itu representation collapse yang terukur
+        # langsung -- lebih intuitif dibanding mean_dim_variance/isotropy.
+        off_diag = ~torch.eye(B, dtype=torch.bool, device=model_sim.device)
+        self.writer.add_scalar("semantic_diagnostics/mean_offdiag_cosine_model", model_sim[off_diag].mean().item(), step)
+        self.writer.add_scalar("semantic_diagnostics/mean_offdiag_cosine_teacher", teacher_sim[off_diag].mean().item(), step)
 
         fig, axs = plt.subplots(1, 3, figsize=(17, 5))
         im0 = axs[0].imshow(teacher_sim.float().cpu().numpy(), cmap="viridis", vmin=-1, vmax=1)
@@ -643,6 +708,49 @@ class Trainer:
             f"| {i} | {txt} |" for i, txt in enumerate(canon_texts)
         )
         self.writer.add_text("semantic_diagnostics/legend_teks", table, global_step=step)
+
+    def _log_grad_norm_decomposition(self, step: int):
+        """
+        Isolasi KOMPONEN mana yang benar-benar mendorong grad_norm total naik
+        menjelang collapse: pecah total loss jadi 3 grup ADITIF yang sudah
+        dikembalikan compute_losses lewat out["_live_terms"] --
+          - "correspondence": (1-lambda)*(syntactic+semantic+magnitude) + canon_len
+          - "sigreg_prior_term": lambda * l_sig_prior   (SIGReg ruang encoder)
+          - "sigreg_canon_term": lambda * sigreg_canon_weight * l_sig_canon
+        Ketiganya dijumlah = total loss yang sama persis dipakai train_step.
+        Pakai SATU forward pass (batch vis yang sama, jadi dropout mask/
+        proyeksi acak SIGReg identik lintas 3 grup -- perbandingan apple-to-
+        apple), lalu torch.autograd.grad per grup (non-destruktif thd .grad
+        param asli, TIDAK mengganggu training step berikutnya) dgn
+        retain_graph=True di semua panggilan kecuali yang terakhir.
+
+        Kalau grad norm "sigreg_prior_term" atau "sigreg_canon_term" mulai
+        meledak/berisik jauh sebelum "correspondence" -- itu konfirmasi
+        langsung bahwa SIGReg (bukan syntactic/semantic/magnitude) adalah
+        sumber ketidakstabilan, bukan cuma dugaan dari grad_norm gabungan.
+        """
+        self.model.eval()
+        batch = move_batch_to_device(self._vis_batch, self.device)
+        _, _, out, _ = compute_losses(
+            self.model, batch, self.criterion, self.n_core, self.n_pneg, self.device,
+            use_amp=self.use_amp, amp_dtype=self.amp_dtype, canon_type=self.canon_type,
+        )
+        live_terms = out["_live_terms"]
+
+        params = [p for p in self.model.parameters() if p.requires_grad]
+        if hasattr(self.criterion, "proj_head"):
+            params += [p for p in self.criterion.proj_head.parameters() if p.requires_grad]
+
+        names = list(live_terms.keys())
+        for i, name in enumerate(names):
+            term = live_terms[name]
+            if not torch.isfinite(term):
+                continue
+            retain = i < len(names) - 1
+            grads = torch.autograd.grad(term, params, retain_graph=retain, allow_unused=True)
+            sq_sum = sum(g.detach().float().pow(2).sum() for g in grads if g is not None)
+            norm = sq_sum.sqrt().item()
+            self.writer.add_scalar(f"grad_diagnostics/{name}", norm, step)
 
     def fit(self, num_epochs: int, lr_scheduler=None, start_epoch: Optional[int] = None,
             save_every_n_epochs: int = 1):

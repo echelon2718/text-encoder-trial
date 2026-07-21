@@ -273,15 +273,36 @@ class SIGReg(nn.Module):
         self.register_buffer("phi", window)
         self.register_buffer("weights", weights * window)
 
-    def forward(self, pooled: torch.Tensor) -> torch.Tensor:
+    def forward(self, pooled: torch.Tensor, return_diagnostics: bool = False):
+        """
+        return_diagnostics=True juga mengembalikan skala argumen yang masuk ke
+        cos/sin -- statistik Epps-Pulley ini HANYA well-conditioned kalau
+        proyeksi (pooled @ A) berskala ~unit-variance (grid `t` cuma sampai
+        t_max=3.0). Kalau skala pooled hanyut menjauh dari situ, cos/sin jadi
+        sensitif (nyaris chaotic) thd perubahan bobot kecil -- gradiennya
+        jadi berisik/meledak tanpa distribusi-nya benar-benar "collapse" dulu.
+        proj_std jauh di atas ~1 atau x_t_max_abs jauh di atas ~2*pi*k adalah
+        tanda konkret sedang masuk rezim aliasing ini.
+        """
         A = torch.randn(pooled.size(-1), self.num_slices, device=pooled.device)
         A = A / A.norm(p=2, dim=0)
-        x_t = (pooled @ A).unsqueeze(-1) * self.t
+        proj = pooled @ A
+        x_t = proj.unsqueeze(-1) * self.t
         err = (x_t.cos().mean(-3) - self.phi).square() + x_t.sin().mean(-3).square()
         statistic = (err @ self.weights) * pooled.size(-2)
-        return statistic.mean()
+        loss = statistic.mean()
+        if not return_diagnostics:
+            return loss
+        with torch.no_grad():
+            diag = {
+                "proj_std": proj.detach().std(),
+                "proj_absmax": proj.detach().abs().max(),
+                "x_t_max_abs": x_t.detach()[..., -1].abs().max(),
+            }
+        return loss, diag
 
-def sigreg_loss(out: dict, sigreg_fn: "SIGReg", key: str = "z_v", mask_key: str = "masks") -> torch.Tensor:
+def sigreg_loss(out: dict, sigreg_fn: "SIGReg", key: str = "z_v", mask_key: str = "masks",
+                 return_diagnostics: bool = False):
     """
     Digeneralisasi supaya bisa dipanggil ke ruang embedding MANA PUN --
     dipakai dua kali di compute_losses: sekali utk 'z_v' (encoder), sekali
@@ -292,7 +313,7 @@ def sigreg_loss(out: dict, sigreg_fn: "SIGReg", key: str = "z_v", mask_key: str 
     """
     z, masks = out[key], out[mask_key]
     pooled = masked_mean(z, masks)
-    return sigreg_fn(pooled.transpose(0, 1))
+    return sigreg_fn(pooled.transpose(0, 1), return_diagnostics=return_diagnostics)
 
 def compute_losses(model, batch, criterion, n_core, n_negation, device, use_amp: bool = True, amp_dtype=torch.bfloat16, canon_type: str = "phoneme"):
     batch = move_batch_to_device(batch, device)
@@ -308,8 +329,10 @@ def compute_losses(model, batch, criterion, n_core, n_negation, device, use_amp:
         )
         l_mag = magnitude_loss(batch, out, criterion.cossim_fn, criterion.proj_head)
 
-        l_sig_prior = sigreg_loss(out, criterion.sigreg_fn, key="z_v", mask_key="masks")
-        l_sig_canon = sigreg_loss(out, criterion.sigreg_fn, key="z_v_canon", mask_key="masks_v_canon")
+        l_sig_prior, diag_prior = sigreg_loss(out, criterion.sigreg_fn, key="z_v", mask_key="masks",
+                                               return_diagnostics=True)
+        l_sig_canon, diag_canon = sigreg_loss(out, criterion.sigreg_fn, key="z_v_canon", mask_key="masks_v_canon",
+                                               return_diagnostics=True)
         l_sig = l_sig_prior + criterion.sigreg_canon_weight * l_sig_canon
         l_len = canon_len_loss(out)
 
@@ -321,9 +344,21 @@ def compute_losses(model, batch, criterion, n_core, n_negation, device, use_amp:
             + criterion.zeta_2_neg * l_sem_negation_combined
             + criterion.zeta_mag * l_mag
         )
-        total = (1 - criterion.lambda_) * canonical_embedding_obj \
-            + criterion.lambda_ * l_sig \
+        correspondence_term = (1 - criterion.lambda_) * canonical_embedding_obj \
             + criterion.canon_len_weight * l_len
+        sigreg_prior_term = criterion.lambda_ * l_sig_prior
+        sigreg_canon_term = criterion.lambda_ * criterion.sigreg_canon_weight * l_sig_canon
+        total = correspondence_term + sigreg_prior_term + sigreg_canon_term
+
+    # Dipakai Trainer utk dekomposisi grad-norm per kelompok loss (lihat
+    # _log_grad_norm_decomposition) -- TIDAK di-detach, karena dipakai lagi
+    # lewat torch.autograd.grad di luar sini pada forward pass TERPISAH
+    # (diagnostik, bukan forward yang sama dgn train_step yang sebenarnya).
+    out["_live_terms"] = {
+        "correspondence": correspondence_term,
+        "sigreg_prior_term": sigreg_prior_term,
+        "sigreg_canon_term": sigreg_canon_term,
+    }
 
     losses = {
         "total": total,
@@ -337,6 +372,13 @@ def compute_losses(model, batch, criterion, n_core, n_negation, device, use_amp:
         "sigreg_prior": l_sig_prior.detach(),
         "sigreg_canon": l_sig_canon.detach(),
         "canon_len": l_len.detach(),
+        # Skala argumen cos/sin SIGReg -- lihat docstring SIGReg.forward.
+        # proj_std jauh > 1 atau x_t_max_abs jauh > ~6-9 (2-3x t_max) = tanda
+        # regime aliasing, BUKAN cuma "SIGReg loss-nya lagi tinggi".
+        "sigreg_prior_proj_std": diag_prior["proj_std"],
+        "sigreg_prior_x_t_max_abs": diag_prior["x_t_max_abs"],
+        "sigreg_canon_proj_std": diag_canon["proj_std"],
+        "sigreg_canon_x_t_max_abs": diag_canon["x_t_max_abs"],
     }
     return total, losses, out, batch
 
