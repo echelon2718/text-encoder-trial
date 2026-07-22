@@ -138,6 +138,15 @@ class TransformerDecoder(nn.Module):
             for _ in range(n_layers)
         ])
         self.canonical_query_library = nn.Embedding(num_embeddings=max_length, embedding_dim=d_model)
+        # LayerNorm di titik masuk decoder -- sebelumnya query_canonical (embedding+PE)
+        # langsung masuk decoder.layers[0] TANPA normalisasi, padahal layer 1..N-1
+        # semuanya menerima input yang SUDAH dinormalisasi oleh norm3 layer sebelumnya
+        # (arsitektur ini Post-LN). Ini bikin decoder.layer_0 punya statistik gradien
+        # yang beda sendiri dari layer lain -- persis pola yang kelihatan di
+        # grad_debug/norm/decoder.layer_0 (selalu paling volatile di antara semua
+        # layer decoder). Menormalkan di sini menyamakan skala input layer_0 dengan
+        # layer-layer setelahnya.
+        self.input_norm = nn.LayerNorm(d_model)
         self.gradient_checkpointing = False  # toggle via model.set_gradient_checkpointing(True)
 
     def forward( # CEK LAGI COK BAGIAN INI SALAH, MASK PADDING QUERY SALAH!
@@ -160,6 +169,7 @@ class TransformerDecoder(nn.Module):
         pe = pe.unsqueeze(0).expand(B, -1, -1).clone() # broadcast to batch size lah
 
         query_canonical = query_canonical + pe
+        query_canonical = self.input_norm(query_canonical)  # normalisasi titik masuk, lihat komentar di __init__
 
         query_mask = length_to_mask(l_star, l_star_max)  # (B, L*_max) bool
         query_canonical = query_canonical * query_mask.unsqueeze(-1)
@@ -236,6 +246,13 @@ class TLeJEPA(nn.Module):
         self.d_model = d_model
         self.text_embedding = nn.Embedding(num_embeddings=n_vocab_text, embedding_dim=d_model)
         self.phoneme_embedding = nn.Embedding(num_embeddings=n_vocab_phoneme, embedding_dim=d_model)
+        # LayerNorm di titik masuk encoder -- sebelumnya embedding+PE langsung masuk
+        # encoder.layers[0] TANPA normalisasi. Dipakai bersama oleh text_embedding
+        # maupun phoneme_embedding (keduanya lewat _embed()) supaya kanonik & semua
+        # view non-kanonik masuk ke encoder dengan skala yang konsisten satu sama
+        # lain, bukan cuma konsisten dgn layer setelahnya. Lihat komentar sejenis di
+        # TransformerDecoder.__init__ untuk decoder.
+        self.embed_norm = nn.LayerNorm(d_model)
         self.encoder = TransformerEncoder(d_model = d_model, n_heads = n_attn_heads, d_ff = 4 * d_model, n_layers = enc_layers, dropout = dropout)
         self.decoder = TransformerDecoder(d_model = d_model, n_heads = n_attn_heads, d_ff = 4 * d_model, n_layers = dec_layers, max_length = max_length, dropout = dropout)
         self.length_predictor = LengthPredictor(d_model = d_model)
@@ -256,7 +273,7 @@ class TLeJEPA(nn.Module):
     def _embed(self, ids: torch.Tensor, use_phoneme: bool) -> torch.Tensor:
         emb = self.phoneme_embedding(ids) if use_phoneme else self.text_embedding(ids)
         pe = sinusoidal_PE(ids.shape[1], self.d_model, device = ids.device)
-        return emb + pe.unsqueeze(0)
+        return self.embed_norm(emb + pe.unsqueeze(0))
 
     def train_forward(self, x: dict, type: str = "phoneme") -> dict:
         assert type in ("phoneme", "text"), "type must be either text or phoneme"
