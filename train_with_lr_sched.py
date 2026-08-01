@@ -41,6 +41,7 @@ def get_args():
     parser.add_argument("--dec-layers", type=int, default=6)
     parser.add_argument("--max-length", type=int, default=4096)
     parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--w_canon", type=float, default=8.0)
 
     parser.add_argument("--num-slices", type=int, default=1024)
     parser.add_argument("--lambda_", type=float, default=0.3,
@@ -93,6 +94,28 @@ def get_args():
                          help="Log diagnostik visual (t-SNE, histogram SIGReg, heatmap semantik) "
                               "ke TensorBoard tiap N step -- TIDAK menunggu 1 epoch selesai. "
                               "Set 0 untuk matikan (cuma logging di akhir epoch, perilaku lama).")
+
+    # --- Debug exploding-gradient ---
+    parser.add_argument("--no-debug-gradients", action="store_true",
+                         help="Matikan GradientDebugger (breakdown grad-norm per grup tiap step + "
+                              "laporan detail otomatis saat grad_norm meledak). Nyala secara default -- "
+                              "overhead-nya kecil (lihat modules/grad_debug.py), tapi matikan ini kalau "
+                              "root cause exploding gradient sudah ketemu & mau kecepatan penuh.")
+    parser.add_argument("--no-debug-activations", action="store_true",
+                         help="Matikan forward hook statistik aktivasi (max|x|/mean|x|/std per layer). "
+                              "Tetap pertahankan breakdown grad-norm per grup. Aktivasi hook dipakai buat "
+                              "melacak layer mana yg PERTAMA menghasilkan nilai non-finite.")
+    parser.add_argument("--debug-spike-ratio", type=float, default=6.0,
+                         help="grad_norm dianggap anomali kalau >= (ratio ini) x rata-rata bergerak (EMA) "
+                              "historisnya.")
+    parser.add_argument("--debug-spike-zscore", type=float, default=6.0,
+                         help="ATAU kalau (grad_norm - EMA) / std >= zscore ini.")
+    parser.add_argument("--debug-warmup-steps", type=int, default=20,
+                         help="Jumlah step awal yang cuma dipakai membangun baseline EMA/std, belum "
+                              "dipakai buat deteksi spike.")
+    parser.add_argument("--debug-max-dumps", type=int, default=20,
+                         help="Batas jumlah file dump detail (.pt) yang disimpan per run, supaya disk "
+                              "tidak kebanjiran kalau training benar-benar divergen berkepanjangan.")
 
     return parser.parse_args()
 
@@ -238,6 +261,7 @@ def main(args):
         zeta_2_neg=args.zeta2_neg,
         zeta_mag=args.zeta_mag,
         sigreg_canon_weight=args.sigreg_canon_weight,
+        w_canon=args.w_canon
     )
 
     optimizer = torch.optim.AdamW(
@@ -271,6 +295,12 @@ def main(args):
         lr_scheduler=lr_scheduler,
         visualize_every_n_steps=(args.visualize_every_n_steps or None),
         lambda_warmup_steps=(args.lambda_warmup_steps or None),
+        debug_gradients=not args.no_debug_gradients,
+        debug_track_activations=not args.no_debug_activations,
+        debug_spike_ratio=args.debug_spike_ratio,
+        debug_spike_zscore=args.debug_spike_zscore,
+        debug_warmup_steps=args.debug_warmup_steps,
+        debug_max_dumps=args.debug_max_dumps,
     )
 
     # --epochs = TOTAL epoch yang ditarget (bukan "epoch tambahan di atas yang
