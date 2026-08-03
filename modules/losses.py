@@ -201,65 +201,6 @@ def semantic_loss(
 
     return l_sem_general, l_sem_negation, l_sem_negation_contrast
 
-
-class TeacherMagnitudeProjection(nn.Module):
-    """
-    Proyeksi linear student (d_model) -> ruang embedding teacher (d_teacher).
-    Modul ini SCAFFOLDING MURNI untuk magnitude_loss:
-      - Parameternya WAJIB didaftarkan ke optimizer yang sama dengan model
-        utama (lihat contoh wiring di bawah). Kalau tidak, dia diam di
-        inisialisasi acak dan magnitude_loss justru MERUSAK training --
-        mendorong z_v_canon mengejar output acak yang tidak berarti.
-      - Modul ini BUKAN bagian dari TLeJEPA dan tidak dipakai saat inference.
-        Setelah training selesai, buang saja state_dict-nya (jangan ikut
-        di-load ke model final).
-    """
-    def __init__(self, d_model: int, d_teacher: int = 768):
-        super().__init__()
-        self.proj = nn.Linear(d_model, d_teacher)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.proj(x)
-
-
-def magnitude_loss(
-    batch: dict,
-    out: dict,
-    cossim_fn,
-    proj_head: "TeacherMagnitudeProjection",
-    eps: float = 1e-6,
-) -> torch.Tensor:
-    """
-    Regresi MSE langsung per-kalimat (bukan matriks N x N seperti
-    semantic_loss) antara embedding teacher MENTAH (belum dinormalisasi --
-    magnitude-nya masih ada) dan pooled decoder output KANONIK (v=0) student,
-    setelah diproyeksikan ke dimensi teacher lewat proj_head.
-
-    Bedanya dari semantic_loss: semantic_loss pakai cosine similarity (murni
-    sudut, F.normalize dulu di kedua sisi) -- di sini MSE mentah otomatis ikut
-    menghukum selisih PANJANG vektor, bukan cuma selisih arah.
-    """
-    if not hasattr(cossim_fn, "get_raw_embeddings"):
-        raise AttributeError(
-            "cossim_fn butuh method get_raw_embeddings(batch) -> (B_total, d_teacher) "
-            "untuk magnitude_loss. Pastikan pakai SemanticTeacherSimilarity / "
-            "CachedSemanticTeacherSimilarity versi terbaru di file ini."
-        )
-
-    teacher_raw = cossim_fn.get_raw_embeddings(batch).detach()
-
-    z_c = out['z_v_canon']
-    m_c = out['masks_v_canon']
-
-    pooled = masked_mean(z_c[:, 0, :, :], m_c[:, 0, :], eps=eps)
-    pooled_proj = proj_head(pooled)
-
-    teacher_centered = teacher_raw - teacher_raw.mean(dim=0, keepdim=True)
-    student_centered = pooled_proj - pooled_proj.mean(dim=0, keepdim=True)
-
-    return F.mse_loss(student_centered, teacher_centered.to(student_centered.device))
-
-
 class SIGReg(nn.Module):
     def __init__(self, knots: int = 17, num_slices: int = 256, t_max: float = 3.0):
         super().__init__()
@@ -306,7 +247,6 @@ def compute_losses(model, batch, criterion, n_core, n_negation, device, use_amp:
             batch, out, criterion.cossim_fn,
             n_core=n_core, negation_offset=n_core - n_negation, n_negation=n_negation,
         )
-        l_mag = magnitude_loss(batch, out, criterion.cossim_fn, criterion.proj_head)
 
         l_sig_prior = sigreg_loss(out, criterion.sigreg_fn, key="z_v", mask_key="masks")
         l_sig_canon = sigreg_loss(out, criterion.sigreg_fn, key="z_v_canon", mask_key="masks_v_canon")
@@ -319,7 +259,6 @@ def compute_losses(model, batch, criterion, n_core, n_negation, device, use_amp:
             criterion.zeta_1 * l_syn
             + criterion.zeta_2 * l_sem_general
             + criterion.zeta_2_neg * l_sem_negation_combined
-            + criterion.zeta_mag * l_mag
         )
         total = (1 - criterion.lambda_) * canonical_embedding_obj \
             + criterion.lambda_ * l_sig \
@@ -332,7 +271,6 @@ def compute_losses(model, batch, criterion, n_core, n_negation, device, use_amp:
         "semantic_general": l_sem_general.detach(),
         "semantic_negation": l_sem_negation.detach(),
         "semantic_negation_contrast": l_sem_negation_contrast.detach(),
-        "magnitude": l_mag.detach(),
         "sigreg": l_sig.detach(),
         "sigreg_prior": l_sig_prior.detach(),
         "sigreg_canon": l_sig_canon.detach(),
@@ -349,7 +287,6 @@ class TLeJEPACriterion:
     zeta_1: float = 1.0
     zeta_2: float = 1.0
     zeta_2_neg: float = 1.0
-    zeta_mag: float = 1.0
     canon_len_weight: float = 1.0
     sigreg_canon_weight: float = 1.0
     w_canon: float = 8.0
