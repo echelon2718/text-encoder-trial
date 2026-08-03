@@ -12,26 +12,26 @@ def canon_len_loss(out: dict) -> torch.Tensor:
     loss = F.mse_loss(torch.log1p(l_v_preds), torch.log1p(l_v_gts))
     return loss
 
+def syntactical_loss(out: dict, w_canon: float = 8.0) -> torch.Tensor:
+    z_c = out['z_v_canon']
+    m_c = out['masks_v_canon']
 
-def syntactical_loss(out: dict) -> torch.Tensor:
-    z_v = out["z_v"]
-    z_canon = out["z_v_canon"]
-    masks = out["masks_v_canon"]
+    B, V, Ls, d = z_c.shape
 
-    B, V = z_canon.shape[0], z_canon.shape[1]
-    L = min(z_v.size(2), z_canon.size(2), masks.size(2))
+    mask = m_c[:, 0, :].view(B, 1, Ls, 1).float()
 
-    mask = masks[:, 0, :L].unsqueeze(-1).float()
+    w = torch.ones(V, device=z_c.device, dtype=z_c.dtype)
+    w[0] = w_canon
+    w_sum = w.sum()
+    w_view = w.view(1, V, 1, 1)
 
-    z_v_trunc = z_v[:, :, :L, :] * mask.unsqueeze(1)
-    mu = z_v_trunc.sum(dim=1) / V
+    z_c_masked = z_c * mask
+    mu_w = (w_view * z_c_masked).sum(dim=1, keepdim=True) / w_sum
 
-    denom = (mask.sum() * z_canon.size(-1) * V).clamp(min=1.0)
-
-    loss = 0.0
-    for v in range(V):
-        z_canon_v = z_canon[:, v, :L, :] * mask
-        loss = loss + F.mse_loss(z_canon_v, mu, reduction='sum')
+    sq = (z_c_masked - mu_w).pow(2) * mask
+    per_view = sq.sum(dim=(0, 2, 3))
+    loss = (w * per_view).sum()
+    denom = (mask.sum() * d * w_sum).clamp(min=1.0)
 
     return loss / denom
 
@@ -352,6 +352,7 @@ class TLeJEPACriterion:
     zeta_mag: float = 1.0
     canon_len_weight: float = 1.0
     sigreg_canon_weight: float = 1.0
+    w_canon: float = 8.0
 
     def to(self, device):
         self.sigreg_fn = self.sigreg_fn.to(device)
