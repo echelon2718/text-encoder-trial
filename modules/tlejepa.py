@@ -149,7 +149,7 @@ class TransformerDecoder(nn.Module):
         self.input_norm = nn.LayerNorm(d_model)
         self.gradient_checkpointing = False  # toggle via model.set_gradient_checkpointing(True)
 
-    def forward( # CEK LAGI COK BAGIAN INI SALAH, MASK PADDING QUERY SALAH!
+    def forward(
         self,
         z: torch.Tensor, # B, L, d_model SATU VIEW
         l_star: torch.Tensor, # B (skalar), KALO TRAINING
