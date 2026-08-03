@@ -14,6 +14,7 @@ from typing import Optional
 
 from modules.losses import compute_losses, TLeJEPACriterion
 from modules.utils import move_batch_to_device, masked_mean, core_split
+from modules.grad_debug import GradientDebugger
 
 try:
     from sklearn.manifold import TSNE
@@ -66,7 +67,8 @@ def find_latest_run_dir(ckpt_root: str, label: str) -> Optional[str]:
 
 def train_step(model, optimizer, batch, criterions, n_core, n_negation, device,
                use_amp=True, amp_dtype=torch.bfloat16, grad_clip: Optional[float] = 1.0,
-               canon_type: str = "phoneme"):
+               canon_type: str = "phoneme", grad_debugger: Optional[GradientDebugger] = None,
+               step: int = 0, log_every_n_steps: int = 20):
     model.train()
     optimizer.zero_grad(set_to_none=True)
     total, losses, out, _ = compute_losses(
@@ -81,9 +83,28 @@ def train_step(model, optimizer, batch, criterions, n_core, n_negation, device,
         losses["grad_norm"] = torch.tensor(0.0)
         losses["lr"] = torch.tensor(optimizer.param_groups[0]["lr"])
         losses["_skipped"] = True
+        if grad_debugger is not None:
+            # Loss itu sendiri sudah NaN/Inf SEBELUM backward() -- akar
+            # masalahnya ada di FORWARD (bukan gradien meledak). Dilaporkan
+            # terpisah supaya tidak salah didiagnosis sebagai exploding grad.
+            grad_debugger.report_forward_anomaly(step, losses, batch)
         return losses, out
 
     total.backward()
+
+    if grad_debugger is not None:
+        # SEBELUM clip_grad_norm_ -- angka yang dicatat harus murni magnitude
+        # gradien ASLI, belum diskalakan turun oleh clipping. Versi "full=False"
+        # ini sengaja diminimalkan sinkronisasi GPU->CPU-nya (lihat grad_debug.py)
+        # supaya boleh dipanggil TIAP step tanpa membebani training yang lama.
+        total_norm_raw, per_group_norm, _, per_group_weight_norm = grad_debugger.compute_grad_norms(full=False)
+        if step % max(1, log_every_n_steps) == 0:
+            grad_debugger.log_lightweight(step, total_norm_raw, per_group_norm, per_group_weight_norm)
+        # observe() sendiri yang memutuskan apakah ini "anomali" (non-finite
+        # atau melonjak jauh di atas EMA historis) -- kalau ya, breakdown
+        # per-parameter yang lebih mahal baru dihitung DI DALAM observe(),
+        # jadi biaya besar itu HANYA muncul saat benar-benar dibutuhkan.
+        grad_debugger.observe(step, total_norm_raw, per_group_norm, per_group_weight_norm, losses, batch)
 
     grad_norm = None
     if grad_clip is not None and grad_clip > 0:
@@ -190,6 +211,15 @@ class Trainer:
         resume_dir: Optional[str] = None,
         lr_scheduler=None,
         lambda_warmup_steps: Optional[int] = None,
+        debug_gradients: bool = True,
+        debug_track_activations: bool = True,
+        debug_spike_ratio: float = 6.0,
+        debug_spike_zscore: float = 6.0,
+        debug_ema_decay: float = 0.98,
+        debug_warmup_steps: int = 20,
+        debug_max_report_params: int = 25,
+        debug_report_cooldown_steps: int = 5,
+        debug_max_dumps: int = 20,
     ):
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.label = label
@@ -254,6 +284,29 @@ class Trainer:
         # sama (bukan grafik baru terpisah).
         run_log_dir = os.path.join(log_dir, self._run_id_safe)
         self.writer = SummaryWriter(log_dir=run_log_dir)
+
+        # --- Debug exploding-gradient ---------------------------------------
+        # Dipasang SEKALI di sini (bukan dibuat ulang tiap step) karena hook
+        # aktivasi butuh nempel ke instance model yang sama sepanjang training.
+        # Set debug_gradients=False kalau root cause sudah ketemu & mau kembali
+        # ke kecepatan penuh tanpa overhead breakdown per-grup tiap step.
+        self.debug_gradients = debug_gradients
+        self.grad_debugger: Optional[GradientDebugger] = None
+        if debug_gradients:
+            self.grad_debugger = GradientDebugger(
+                model=self.model,
+                criterion=self.criterion,
+                writer=self.writer,
+                ckpt_dir=self.ckpt_dir,
+                spike_ratio=debug_spike_ratio,
+                spike_zscore=debug_spike_zscore,
+                ema_decay=debug_ema_decay,
+                warmup_steps=debug_warmup_steps,
+                max_report_params=debug_max_report_params,
+                track_activations=debug_track_activations,
+                report_cooldown_steps=debug_report_cooldown_steps,
+                max_dumps=debug_max_dumps,
+            )
 
         self.global_step = 0
         self.best_val_loss = float("inf")
@@ -344,6 +397,8 @@ class Trainer:
                     self.model, self.optimizer, batch, self.criterion, self.n_core, self.n_pneg,
                     self.device, use_amp=self.use_amp,
                     amp_dtype=self.amp_dtype, grad_clip=self.grad_clip, canon_type=self.canon_type,
+                    grad_debugger=self.grad_debugger, step=self.global_step,
+                    log_every_n_steps=self.log_every_n_steps,
                 )
             except RuntimeError as e:
                 is_oom = "out of memory" in str(e).lower()
@@ -690,5 +745,15 @@ class Trainer:
         epoch_bar.close()
 
     def close(self):
+        if self.grad_debugger is not None:
+            summary = self.grad_debugger.summary()
+            tqdm.write(
+                f"[Trainer] Ringkasan GradientDebugger: "
+                f"{summary['n_anomalies_total']} anomali terdeteksi sepanjang run, "
+                f"{summary['n_dumps_written']} dump detail tersimpan di "
+                f"{os.path.join(self.ckpt_dir, 'anomaly_dumps')}, "
+                f"anomali terakhir di step={summary['last_anomaly_step']}."
+            )
+            self.grad_debugger.remove_hooks()
         self.writer.flush()
         self.writer.close()
