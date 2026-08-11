@@ -136,6 +136,46 @@ class GradNormMonitor:
         return spike
 
 
+def clip_grad_per_component(model, max_norm: float):
+    """
+    Clipping PER KOMPONEN, bukan atas satu norma global.
+
+    Alasannya terukur. Pada run sebelumnya rasio gradien-terhadap-bobot mencapai
+    3,86 pada text_embedding dan 1,98 pada encoder.layer_0, sementara seluruh
+    komponen decoder datar di 0,002. Dengan clipping global, satu komponen yang
+    meledak mendominasi norma total sehingga faktor penskalaan menyeret SELURUH
+    komponen sehat ikut mengecil -- clip_frac tercatat 0,93 sampai 0,97, artinya
+    hampir setiap langkah mengalami hal itu. Membatasi tiap kelompok parameter
+    secara terpisah memutus kontaminasi tersebut.
+
+    Perlu disadari bahwa ini MELONGGARKAN batas total, bukan mengetatkannya:
+    dengan G kelompok yang masing-masing dibatasi c, norma total dapat mencapai
+    c*sqrt(G). Konsekuensi itu diterima secara sadar dan dikompensasi oleh laju
+    pembelajaran akhir yang jauh lebih rendah.
+
+    Mengembalikan norma total SEBELUM clipping, supaya angka yang dicatat tetap
+    sebanding dengan run-run terdahulu.
+    """
+    groups = {}
+    for name, p in model.named_parameters():
+        if p.grad is None:
+            continue
+        # Kelompok = dua ruas pertama nama parameter, mis. "encoder.layers.3..."
+        # -> "encoder.layers.3" bila berupa layer, selain itu ruas pertama.
+        parts = name.split(".")
+        if len(parts) >= 3 and parts[1] in ("layers",):
+            key = ".".join(parts[:3])
+        else:
+            key = parts[0]
+        groups.setdefault(key, []).append(p)
+
+    total_sq = 0.0
+    for params in groups.values():
+        gn = torch.nn.utils.clip_grad_norm_(params, max_norm)
+        total_sq = total_sq + gn.detach() ** 2
+    return torch.sqrt(total_sq) if groups else torch.zeros(())
+
+
 def train_step(model, optimizer, batch, criterions, n_core, n_negation, device,
                use_amp=True, amp_dtype=torch.bfloat16, grad_clip: Optional[float] = 1.0,
                canon_type: str = "phoneme", grad_debugger: Optional[GradientDebugger] = None,
@@ -182,14 +222,23 @@ def train_step(model, optimizer, batch, criterions, n_core, n_negation, device,
 
     grad_norm = None
     if grad_clip is not None and grad_clip > 0:
-        # Sejak magnitude_loss dihapus (paper 5.8) tidak ada lagi proj_head,
-        # jadi seluruh parameter yang dioptimasi memang hanya model.parameters().
-        grad_norm = torch.nn.utils.clip_grad_norm_(list(model.parameters()), grad_clip)
+        grad_norm = clip_grad_per_component(model, grad_clip)
 
     if grad_norm is not None:
         gn = float(grad_norm)
-        bad = (not torch.isfinite(grad_norm)) or (
-            grad_monitor is not None and grad_monitor.is_spike(gn))
+        # Dua hal yang berbeda, dan hanya satu yang boleh dimatikan.
+        #
+        # NaN/Inf WAJIB dibuang: clip_grad_norm_ atas gradien tak finit
+        # menghasilkan tak finit pula, dan bobot rusak permanen. Clipping tidak
+        # dapat menyelamatkan kasus ini.
+        #
+        # Spike yang finit ditangani clipping per komponen, jadi ambangnya
+        # dinaikkan (baku 50) sampai praktis hanya menyala untuk anomali ekstrem.
+        # Membuang step tidak memperbaiki ketidakstabilan sistemik; ia hanya
+        # membuang data, dan yang terbuang justru langkah-langkah tersulit.
+        not_finite = not torch.isfinite(grad_norm)
+        spike = grad_monitor is not None and grad_monitor.is_spike(gn)
+        bad = not_finite or spike
         if bad:
             # Buang step ini sepenuhnya: gradiennya tidak dipercaya.
             optimizer.zero_grad(set_to_none=True)
@@ -278,8 +327,8 @@ class Trainer:
         lambda_warmup_steps: Optional[int] = None,
         debug_gradients: bool = True,
         debug_track_activations: bool = True,
-        debug_spike_ratio: float = 6.0,
-        debug_spike_zscore: float = 6.0,
+        debug_spike_ratio: float = 50.0,
+        debug_spike_zscore: float = 50.0,
         debug_ema_decay: float = 0.98,
         debug_warmup_steps: int = 20,
         debug_max_report_params: int = 25,
