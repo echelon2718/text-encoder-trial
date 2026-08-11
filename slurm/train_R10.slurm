@@ -9,7 +9,7 @@
 #SBATCH --signal=B:USR1@300
 #SBATCH --requeue
 #
-# R10: SIGReg di Z_c (H6)
+# R10: SIGReg HANYA di ruang decoder (ablasi H6)
 #
 # --requeue + --signal=B:USR1@300 : SLURM memberi jendela 300 detik sebelum
 # SIGKILL sehingga Trainer sempat menyimpan latest_step.pt, lalu job dijadwalkan
