@@ -362,18 +362,42 @@ class SIGReg(nn.Module):
             return torch.cat(stats, dim=-1).mean()
 
 
-def sigreg_loss(out, sigreg_fn, space: str = "encoder") -> torch.Tensor:
+def sigreg_loss(out, sigreg_fn, space: str = "both",
+                w_encoder: float = 0.5, w_decoder: float = 0.5):
     """
-    space="encoder" (baku, paper 5.8.3) -> populasi dari Pool(H) dengan m_src
-    space="decoder" (ablasi R10)        -> populasi dari Pool(Z_c) dengan m_content
+    space="both"    (baku) -> Pool(H) DAN Pool(Z_c), masing-masing berbobot
+    space="encoder"        -> hanya Pool(H) dengan m_src
+    space="decoder"        -> hanya Pool(Z_c) dengan m_content
+
+    Ruang decoder disertakan karena eksperimen menunjukkan H6 tidak berlaku:
+    ruang encoder tetap sehat (SIGReg 0,039 dan norma pooled 21,6) sementara
+    ruang decoder menyusut hingga norma minimum 3,26 dan kosinus antar-sampel
+    acak mencapai 0,9999. SIGReg pada Pool(H) tidak merambat ke Z_c karena
+    keduanya dipisahkan oleh decoder, dan tidak ada suku lain yang mengatur
+    distribusi Z_c: L_sem murni kosinus sehingga buta terhadap skala, dan
+    L_syn hanya menuntut kesepakatan antar-view yang dapat dipenuhi pada
+    subruang berdimensi rendah.
+
+    Mengembalikan (total, komponen_encoder, komponen_decoder) supaya keduanya
+    dapat dipantau terpisah di TensorBoard.
     """
-    if space == "encoder":
-        pooled = masked_mean(out["z_v"], out["masks"])
-    elif space == "decoder":
-        pooled = masked_mean(out["z_v_canon"], out["masks_v_content"])
-    else:
+    zero = torch.zeros((), device=out["z_v"].device)
+    l_enc, l_dec = zero, zero
+
+    if space in ("encoder", "both"):
+        l_enc = sigreg_fn(masked_mean(out["z_v"], out["masks"]).transpose(0, 1))
+    if space in ("decoder", "both") and not out.get("encoder_only", False):
+        l_dec = sigreg_fn(
+            masked_mean(out["z_v_canon"], out["masks_v_content"]).transpose(0, 1)
+        )
+    if space not in ("encoder", "decoder", "both"):
         raise ValueError(f"space tidak dikenal: {space}")
-    return sigreg_fn(pooled.transpose(0, 1))
+
+    if space == "encoder":
+        return l_enc, l_enc, zero
+    if space == "decoder":
+        return l_dec, zero, l_dec
+    return w_encoder * l_enc + w_decoder * l_dec, l_enc, l_dec
 
 
 def sigreg_encoder_loss(out, sigreg_fn) -> torch.Tensor:
@@ -431,7 +455,12 @@ class TLeJEPACriterion:
     eta_empty: float = 1.0
     tau_l: float = 0.9
     stopgrad_canon: bool = False
-    sigreg_space: str = "encoder"     # "decoder" untuk ablasi R10
+    # "both" (baku), "encoder", atau "decoder". Bobot masing-masing ruang
+    # berjumlah 1,0 supaya lambda_ tetap menyatakan trade-off total terhadap
+    # cabang prediktif, tidak berubah artinya ketika ruang ditambah.
+    sigreg_space: str = "both"
+    sigreg_w_encoder: float = 0.5
+    sigreg_w_decoder: float = 0.5
 
     # Normalisasi bobot cabang prediktif. Tanpa ini, mematikan satu suku saat
     # ablasi juga menurunkan magnitudo cabang prediktif, sehingga bobot relatif
@@ -480,8 +509,12 @@ def compute_losses(model, batch, criterion, n_core, n_negation, device,
             batch, out, criterion.cossim_fn,
             n_core=n_core, negation_offset=n_core - n_negation, n_negation=n_negation,
             encoder_only=enc_only)
-        l_sig = sigreg_loss(out, criterion.sigreg_fn,
-                            space="encoder" if enc_only else criterion.sigreg_space)
+        l_sig, l_sig_enc, l_sig_dec = sigreg_loss(
+            out, criterion.sigreg_fn,
+            space="encoder" if enc_only else criterion.sigreg_space,
+            w_encoder=criterion.sigreg_w_encoder,
+            w_decoder=criterion.sigreg_w_decoder,
+        )
 
         l_sem_neg_combined = l_sem_negation + l_sem_contrast
 
@@ -531,6 +564,8 @@ def compute_losses(model, batch, criterion, n_core, n_negation, device,
         "semantic_negation": l_sem_negation.detach(),
         "semantic_negation_contrast": l_sem_contrast.detach(),
         "sigreg": l_sig.detach(),
+        "sigreg_encoder": l_sig_enc.detach(),
+        "sigreg_decoder": l_sig_dec.detach(),
         "canon_len": l_len.detach(),
         **{k: v.detach() for k, v in diag.items()},
     }
