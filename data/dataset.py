@@ -168,7 +168,14 @@ def collate_fn(batch, pad_value=0, max_seq_len: int = 4096):
     return {
         "id": [b["id"] for b in batch],
         "x": torch.stack(batch_x),
-        "texts": [[b["x_canon_text"]] + b["x_aug_1"] + b["x_aug_2"] for b in batch],
+        # texts[i] sejajar dengan view ke-i pada x. Indeks 0 (anchor) dan indeks 1
+        # (grafem kanonik) sama-sama memakai teks kanonik: view 0 adalah realisasi
+        # fonemnya, view 1 adalah teksnya sendiri. Teacher semantik membaca
+        # texts[0], yaitu teks kanonik.
+        "texts": [
+            [b["x_canon_text"], b["x_canon_text"]] + b["x_aug_1"] + b["x_aug_2"]
+            for b in batch
+        ],
         "x_lengths": [[l + 2 for l in b["x_lengths"]] for b in batch],
         "mask": torch.stack(batch_mask),
     }
@@ -184,7 +191,18 @@ class AugmentDataset(Dataset):
         tokenizer: Optional[PhonemeTokenizer] = None,
         max_text_chars: Optional[int] = _MAX_TEXT_CHARS,
         exempt_id_prefix: str = _EXEMPT_ID_PREFIX,
+        canon_mode: str = "phoneme",
+        n_aug_1: int = 3,
+        n_aug_2: int = 2,
     ):
+        assert canon_mode in ("phoneme", "text"), (
+            f"canon_mode harus 'phoneme' atau 'text', dapat {canon_mode!r}"
+        )
+        # Disimpan sebagai atribut karena DataLoader hanya memanggil dataset[idx];
+        # argumen default pada __getitem__ tidak bisa diatur dari luar.
+        self.canon_mode = canon_mode
+        self.n_aug_1 = n_aug_1
+        self.n_aug_2 = n_aug_2
         if hf_dataset is not None:
             self.dataset = hf_dataset
         else:
@@ -209,7 +227,10 @@ class AugmentDataset(Dataset):
     def __len__(self):
         return self._n
 
-    def __getitem__(self, idx, n_aug_1=3, n_aug_2=2, canon_mode="phoneme"):
+    def __getitem__(self, idx, n_aug_1=None, n_aug_2=None, canon_mode=None):
+        n_aug_1 = self.n_aug_1 if n_aug_1 is None else n_aug_1
+        n_aug_2 = self.n_aug_2 if n_aug_2 is None else n_aug_2
+        canon_mode = self.canon_mode if canon_mode is None else canon_mode
         try:
             return self._getitem_impl(idx, n_aug_1, n_aug_2, canon_mode)
         except Exception as e:
@@ -255,14 +276,28 @@ class AugmentDataset(Dataset):
             for _ in range(remaining):
                 x_aug_2.append(self.augmenter.augment_hard_surface(text))
 
+        # V' = V + 1 view. Indeks 0 = anchor, indeks 1 = grafem kanonik yang TIDAK
+        # pernah jadi anchor, indeks 2..V = augmentasi.
+        #
+        # Anchor DITAMBAHKAN, bukan menggantikan: seluruh view augmentasi tetap
+        # utuh dan grafem kanonik selalu hadir sebagai view tersendiri, sehingga
+        # pemetaan teks-kanonik -> representasi-kanonik selalu tersupervisi.
+        # Itu penting karena saat inferensi model justru menerima teks bersih.
+        #
+        # Pada canon_mode="text", indeks 0 dan 1 memuat tensor IDENTIK. Redundansi
+        # itu disengaja: bentuk tensor dan jumlah forward pass jadi sama persis di
+        # kedua modalitas anchor, sehingga perbandingan modalitas tidak terkonfound
+        # oleh perbedaan banyaknya view augmentasi.
+        x_graph_canon = torch.tensor(list(text.encode("utf-8")), dtype=torch.long)
         if canon_mode == "phoneme":
-            x_canon = self.phoneme_tokenizer.encode_single(phoneme)
+            x_anchor = self.phoneme_tokenizer.encode_single(phoneme)
         else:
-            x_canon = torch.tensor(list(text.encode("utf-8")), dtype=torch.long)
+            x_anchor = x_graph_canon.clone()
 
         x_v = x_aug_1 + x_aug_2
         x_v = [torch.tensor(list(t.encode("utf-8")), dtype=torch.long) for t in x_v]
-        x_lengths = [len(x_i) for x_i in [x_canon] + x_v]
+        x_all = [x_anchor, x_graph_canon] + x_v
+        x_lengths = [len(x_i) for x_i in x_all]
 
         return {
             "id": data_id,
@@ -270,6 +305,7 @@ class AugmentDataset(Dataset):
             "x_canon_text": text,
             "x_aug_1": x_aug_1,
             "x_aug_2": x_aug_2,
-            "x": [x_canon] + x_v,
+            "x": x_all,
             "x_lengths": x_lengths,
+            "canon_mode": canon_mode,
         }
