@@ -202,7 +202,13 @@ def adapt_to_canvas(src, src_len, canvas_len, M_max, tau_r: float = 0.3):
         res, res_mask = gaussian_resample(
             src[idx], src_mask[idx], canvas_len[idx], tau_r=tau_r, target_max=M_max
         )
-        out[idx] = res
+        # .to(out.dtype) WAJIB. torch.bmm di dalam gaussian_resample berjalan
+        # di bawah autocast sehingga mengembalikan bf16 walau masukannya fp32,
+        # sedangkan `out` berasal dari LayerNorm yang autocast pertahankan fp32.
+        # Tanpa konversi ini index_put melempar RuntimeError, batch dibuang, dan
+        # yang dibuang justru batch dengan view underestimate -- yaitu satu-satunya
+        # kasus yang melatih jalur resampling ini.
+        out[idx] = res.to(out.dtype)
         out_mask[idx] = res_mask
 
     canvas_mask = length_to_mask(canvas_len, M_max)
