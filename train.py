@@ -67,7 +67,13 @@ def get_args():
     p.add_argument("--encoder-only", action="store_true",
                    help="R11: buang decoder, proyektor kanvas, dan prediktor panjang. "
                         "Objektif bekerja pada Pool(H). Setara LeJEPA polos pada teks.")
-    p.add_argument("--sigreg-space", type=str, default="encoder", choices=["encoder", "decoder"],
+    p.add_argument("--sigreg-w-encoder", type=float, default=0.5,
+                   help="Bobot SIGReg pada ruang encoder. Bersama --sigreg-w-decoder "
+                        "berjumlah 1,0 supaya --lambda_ tetap menyatakan trade-off total.")
+    p.add_argument("--sigreg-w-decoder", type=float, default=0.5,
+                   help="Bobot SIGReg pada ruang decoder.")
+    p.add_argument("--sigreg-space", type=str, default="both",
+                   choices=["encoder", "decoder", "both"],
                    help="Ruang tempat SIGReg bekerja. 'decoder' adalah ablasi R10.")
     p.add_argument("--empty-norm-ratio", type=float, default=0.35,
                    help="Ambang relatif deteksi batas konten saat inferensi. Bertumpu pada "
@@ -111,7 +117,7 @@ def get_args():
                         "SIGReg -- dua variabel berubah sekaligus.")
 
     # --- SIGReg (paper 5.8.3: ruang encoder, level kalimat) ---
-    p.add_argument("--num-slices", type=int, default=256)
+    p.add_argument("--num-slices", type=int, default=512)
     p.add_argument("--sigreg-knots", type=int, default=17)
     p.add_argument("--sigreg-t-max", type=float, default=3.0)
 
@@ -154,8 +160,8 @@ def get_args():
     # --- Debug ---
     p.add_argument("--no-debug-gradients", action="store_true")
     p.add_argument("--no-debug-activations", action="store_true")
-    p.add_argument("--debug-spike-ratio", type=float, default=6.0)
-    p.add_argument("--debug-spike-zscore", type=float, default=6.0)
+    p.add_argument("--debug-spike-ratio", type=float, default=50.0)
+    p.add_argument("--debug-spike-zscore", type=float, default=50.0)
     p.add_argument("--debug-warmup-steps", type=int, default=20)
     p.add_argument("--debug-max-dumps", type=int, default=20)
 
@@ -309,6 +315,8 @@ def main(args):
         tau_l=args.tau_l,
         stopgrad_canon=args.stopgrad_canon,
         sigreg_space=args.sigreg_space,
+        sigreg_w_encoder=args.sigreg_w_encoder,
+        sigreg_w_decoder=args.sigreg_w_decoder,
         normalize_obj_weights=not args.no_normalize_obj_weights,
     )
 
