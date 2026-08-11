@@ -35,7 +35,7 @@ tlejepa_setup_env
 SCAN_INTERVAL="${SCAN_INTERVAL:-300}"
 MAX_RETRY="${MAX_RETRY:-20}"
 STATE="$TLEJEPA_ROOT/logs/watchdog_state.tsv"
-RUNS=(${WATCH_RUNS:-R1 R2 R3 R4 R5 R6 R7 R8 R9 R10 R11a R11b})
+RUNS=(${WATCH_RUNS:-R1 R2 R3 R4 R5 R6 R7 R8 R9 R10 R11a R11b R12})
 
 touch "$STATE"
 
@@ -80,7 +80,7 @@ while true; do
         c=$((c + 1))
         set_retry "$r" "$c"
         slot="A"
-        case "$r" in R2|R3|R5|R6|R9|R11a) slot="B";; esac
+        case "$r" in R2|R3|R5|R6|R9|R11a|R12) slot="B";; esac
         if [ "$slot" = "A" ]; then gpu="$TLEJEPA_GPU_A"; else gpu="$TLEJEPA_GPU_B"; fi
         jid=$(sbatch --parsable \
               --partition="$TLEJEPA_GPU_PARTITION" \
