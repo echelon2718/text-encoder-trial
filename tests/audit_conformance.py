@@ -178,7 +178,8 @@ def audit_5_7_forward():
     o = m.train_forward(mk_batch(), type="phoneme")
     check(S, "anchor selalu L^A natural",
           bool((o["canvas_len"][:, 0] == o["l_anchor"].long()).all()))
-    check(S, "target teradaptasi tersedia", "target" in o and "target_mask" in o)
+    check(S, "penyelarasan koordinat kanonik tersedia",
+          "z_ref" in o and "ref_mask" in o)
     check(S, "kanvas seragam antar view saat teacher-forced",
           bool((o["canvas_len"] == o["canvas_len"][:, :1]).all()))
     check(S, "tidak ada wilayah kosong saat teacher-forced",
@@ -191,8 +192,8 @@ def audit_5_7_forward():
     beda = not bool((o2["canvas_len"] == o2["canvas_len"][:, :1]).all())
     check(S, "MIXED-LENGTH: kanvas berbeda antar view", beda, "diharapkan")
     check(S, "MIXED-LENGTH: adaptasi target Tahap 9 terpasang",
-          o2["target"].shape == o2["z_v_canon"].shape,
-          f"target {tuple(o2['target'].shape)}")
+          o2["z_ref"].shape == o2["z_v_canon"].shape,
+          f"z_ref {tuple(o2['z_ref'].shape)}")
 
     check(S, "m_content subset m_canvas",
           bool((o2["masks_v_content"] & ~o2["masks_v_canon"]).sum() == 0))
@@ -215,12 +216,20 @@ def audit_5_8_backward():
     m = mk_model(); m.train()
     o = m.train_forward(mk_batch(), type="phoneme")
 
-    # SIGReg: encoder ya, decoder tidak
-    sigreg_loss(o, SIGReg(num_slices=16)).backward(retain_graph=True)
+    # SIGReg kini bekerja pada DUA ruang. H6 ("encoder saja memadai") terbantah
+    # eksperimen: ruang encoder tetap sehat sementara ruang decoder menyusut
+    # hingga norma minimum 3,26 dan kosinus antar-sampel acak 0,9999.
+    sigreg_loss(o, SIGReg(num_slices=16))[0].backward(retain_graph=True)
     gE = sum(float(p.grad.abs().sum()) for p in m.encoder.parameters() if p.grad is not None)
     gD = sum(float(p.grad.abs().sum()) for p in m.decoder.parameters() if p.grad is not None)
     check(S, "SIGReg -> encoder != 0", gE > 0, f"{gE:.2e}")
-    check(S, "SIGReg -> decoder = 0", gD == 0.0, f"{gD:.2e}")
+    check(S, "SIGReg -> decoder != 0 (space=both)", gD > 0, f"{gD:.2e}")
+
+    m2 = mk_model(); m2.train()
+    o_e = m2.train_forward(mk_batch(), type="phoneme")
+    sigreg_loss(o_e, SIGReg(num_slices=16), space="encoder")[0].backward()
+    gD_e = sum(float(p.grad.abs().sum()) for p in m2.decoder.parameters() if p.grad is not None)
+    check(S, "space='encoder' -> decoder tetap 0", gD_e == 0.0, f"{gD_e:.2e}")
 
     # l_empty mati pada mode default
     o_tf = mk_model().train_forward(mk_batch(), type="phoneme")
@@ -267,7 +276,7 @@ def audit_losses_edges():
     # B kecil untuk SIGReg
     mm = mk_model(); mm.train()
     o = mm.train_forward(mk_batch(B=1, V=2, L=8), type="phoneme")
-    s = sigreg_loss(o, SIGReg(num_slices=8))
+    s = sigreg_loss(o, SIGReg(num_slices=8))[0]
     check(S, "EDGE SIGReg dengan B=1", bool(torch.isfinite(s)),
           "populasi 1 sampel -> statistik degenerate", warn_only=not torch.isfinite(s))
 
