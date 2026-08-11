@@ -13,8 +13,12 @@ from tqdm.auto import tqdm
 from typing import Optional
 
 from modules.losses import compute_losses, TLeJEPACriterion
+from modules import research_metrics as RM
 from modules.utils import move_batch_to_device, masked_mean, core_split
-from modules.grad_debug import GradientDebugger
+try:
+    from modules.grad_debug import GradientDebugger
+except ImportError:  # modul debug opsional; belum ter-commit di sebagian branch
+    GradientDebugger = None
 
 try:
     from sklearn.manifold import TSNE
@@ -65,15 +69,85 @@ def find_latest_run_dir(ckpt_root: str, label: str) -> Optional[str]:
     candidates.sort(key=lambda x: x[0])
     return candidates[-1][1]
 
+
+class GradNormMonitor:
+    """
+    Penjaga spike berbasis ambang RELATIF.
+
+    train_step lama hanya menolak grad_norm non-finite. Nilai seperti 1e9 itu
+    finite, jadi lolos: clip_grad_norm_ menormalkannya ke `grad_clip` dengan
+    ARAH TETAP, lalu Adam menormalisasi per-parameter sehingga langkahnya
+    kembali berukuran ~lr. Artinya gradien yang arahnya sudah rusak tetap
+    dieksekusi penuh. Beberapa langkah seperti itu cukup untuk merusak
+    representasi -- persis pola "grad meledak dulu, collapse menyusul".
+    """
+
+    def __init__(self, ratio: float = 6.0, warmup: int = 50, beta: float = 0.98):
+        self.ratio, self.warmup, self.beta = ratio, warmup, beta
+        self.ema = None
+        self.n_seen = 0
+        self.n_skipped = 0
+        self.n_ema_breach = 0
+
+    def state_dict(self) -> dict:  # n_ema_breach ikut supaya resume tidak reset counter
+        return {"ema": self.ema, "n_seen": self.n_seen, "n_skipped": self.n_skipped,
+                "n_ema_breach": self.n_ema_breach}
+
+    def load_state_dict(self, d: dict):
+        self.ema = d.get("ema", None)
+        self.n_seen = d.get("n_seen", 0)
+        self.n_skipped = d.get("n_skipped", 0)
+        self.n_ema_breach = d.get("n_ema_breach", 0)
+
+    def ema_value(self) -> float:
+        return float(self.ema) if self.ema is not None else 0.0
+
+    def check_persistent_explosion(self, threshold: float, n_required: int) -> bool:
+        """
+        Ledakan PERSISTEN != spike tunggal.
+
+        Spike tunggal sudah ditangani is_spike() (step-nya dibuang, bobot tidak
+        diupdate) dan tidak perlu diberitahukan ke manusia. Yang perlu dialertkan
+        adalah kalau EMA grad-norm ITU SENDIRI berada di atas ambang selama
+        `n_required` pengecekan berturut-turut, karena artinya training sudah
+        divergen secara persisten, bukan kena satu batch aneh.
+
+        Counter di-reset begitu EMA turun kembali di bawah ambang, jadi alert
+        hanya menyala untuk kondisi yang benar-benar bertahan.
+        """
+        if self.ema is None or self.n_seen < self.warmup:
+            return False
+        if float(self.ema) > threshold:
+            self.n_ema_breach += 1
+        else:
+            self.n_ema_breach = 0
+        return self.n_ema_breach >= n_required
+
+    def is_spike(self, g: float) -> bool:
+        self.n_seen += 1
+        if self.ema is None:
+            self.ema = g
+            return False
+        spike = (self.n_seen > self.warmup) and (g > self.ratio * self.ema)
+        if spike:
+            self.n_skipped += 1
+        else:  # EMA hanya diperbarui dari step yang sehat
+            self.ema = self.beta * self.ema + (1 - self.beta) * g
+        return spike
+
+
 def train_step(model, optimizer, batch, criterions, n_core, n_negation, device,
                use_amp=True, amp_dtype=torch.bfloat16, grad_clip: Optional[float] = 1.0,
                canon_type: str = "phoneme", grad_debugger: Optional[GradientDebugger] = None,
-               step: int = 0, log_every_n_steps: int = 20):
+               step: int = 0, log_every_n_steps: int = 20,
+               grad_monitor: Optional["GradNormMonitor"] = None,
+               compute_rank: bool = False):
     model.train()
     optimizer.zero_grad(set_to_none=True)
     total, losses, out, _ = compute_losses(
         model, batch, criterions, n_core, n_negation, device,
-        use_amp=use_amp, amp_dtype=amp_dtype, canon_type=canon_type
+        use_amp=use_amp, amp_dtype=amp_dtype, canon_type=canon_type,
+        compute_rank=compute_rank,
     )
 
     if not torch.isfinite(total):
@@ -108,22 +182,22 @@ def train_step(model, optimizer, batch, criterions, n_core, n_negation, device,
 
     grad_norm = None
     if grad_clip is not None and grad_clip > 0:
-        # proj_head IKUT di-clip -- sebelumnya cuma model.parameters(),
-        # padahal proj_head ikut dioptimasi optimizer yang sama (lihat
-        # train_with_lr_sched.py) dan menerima gradien MSE tak-scale-invariant
-        # dari magnitude_loss.
-        clip_params = list(model.parameters())
-        if criterions is not None and hasattr(criterions, "proj_head"):
-            clip_params += list(criterions.proj_head.parameters())
-        grad_norm = torch.nn.utils.clip_grad_norm_(clip_params, grad_clip)
+        # Sejak magnitude_loss dihapus (paper 5.8) tidak ada lagi proj_head,
+        # jadi seluruh parameter yang dioptimasi memang hanya model.parameters().
+        grad_norm = torch.nn.utils.clip_grad_norm_(list(model.parameters()), grad_clip)
 
-    if grad_norm is not None and not torch.isfinite(grad_norm):
-        optimizer.zero_grad(set_to_none=True)
-        losses["total"] = total.detach()
-        losses["grad_norm"] = grad_norm.detach()
-        losses["lr"] = torch.tensor(optimizer.param_groups[0]["lr"])
-        losses["_skipped"] = True
-        return losses, out
+    if grad_norm is not None:
+        gn = float(grad_norm)
+        bad = (not torch.isfinite(grad_norm)) or (
+            grad_monitor is not None and grad_monitor.is_spike(gn))
+        if bad:
+            # Buang step ini sepenuhnya: gradiennya tidak dipercaya.
+            optimizer.zero_grad(set_to_none=True)
+            losses["total"] = total.detach()
+            losses["grad_norm"] = grad_norm.detach()
+            losses["lr"] = torch.tensor(optimizer.param_groups[0]["lr"])
+            losses["_skipped"] = True
+            return losses, out
 
     optimizer.step()
 
@@ -155,11 +229,6 @@ def save_model(path, model, optimizer, epoch, best_metric, scheduler=None,
     if scheduler is not None:
         ckpt["scheduler_state_dict"] = scheduler.state_dict()
 
-    if criterion is not None and hasattr(criterion, "proj_head"):
-        ckpt["criterion_extra_state_dict"] = {
-            "proj_head": criterion.proj_head.state_dict(),
-        }
-
     merged_extra = dict(extra or {})
     if global_step is not None:
         merged_extra["global_step"] = global_step
@@ -175,10 +244,6 @@ def load_model(path, model, optimizer=None, scheduler=None, map_location=None, c
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
     if scheduler is not None and "scheduler_state_dict" in ckpt:
         scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-    if criterion is not None and hasattr(criterion, "proj_head"):
-        extra_state = ckpt.get("criterion_extra_state_dict", {})
-        if "proj_head" in extra_state:
-            criterion.proj_head.load_state_dict(extra_state["proj_head"])
     global_step = ckpt.get("extra", {}).get("global_step", 0)
     return ckpt.get("epoch", 0), ckpt.get("best_metric", float("inf")), global_step
 
@@ -220,6 +285,12 @@ class Trainer:
         debug_max_report_params: int = 25,
         debug_report_cooldown_steps: int = 5,
         debug_max_dumps: int = 20,
+        grad_ema_threshold: float = 50.0,
+        grad_breach_required: int = 5,
+        max_steps: Optional[int] = None,
+        research_every_n_steps: Optional[int] = 2000,
+        augmenter=None,
+        n_aug_1: int = 3,
     ):
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.label = label
@@ -292,7 +363,10 @@ class Trainer:
         # ke kecepatan penuh tanpa overhead breakdown per-grup tiap step.
         self.debug_gradients = debug_gradients
         self.grad_debugger: Optional[GradientDebugger] = None
-        if debug_gradients:
+        self.grad_monitor = GradNormMonitor(ratio=debug_spike_ratio, warmup=debug_warmup_steps)
+        self._n_clipped = 0
+        self._n_steps_done = 0
+        if debug_gradients and GradientDebugger is not None:
             self.grad_debugger = GradientDebugger(
                 model=self.model,
                 criterion=self.criterion,
@@ -308,6 +382,25 @@ class Trainer:
                 max_dumps=debug_max_dumps,
             )
 
+        # Ambang dipasang pada EMA grad-norm (default 50), BUKAN grad-norm sesaat:
+        # spike tunggal sudah dibuang otomatis dan tidak perlu dicatat.
+        self.grad_ema_threshold = grad_ema_threshold
+        self.grad_breach_required = grad_breach_required
+        # Metrik riset dihitung berkala supaya konfigurasi yang jelas gagal bisa
+        # dihentikan lebih awal, bukan ditunggu sampai run selesai.
+        self.research_every_n_steps = research_every_n_steps
+        self.augmenter = augmenter
+        self.n_aug_1 = n_aug_1
+        self._probe_texts = None
+        self._current_epoch = 0
+        self._death_handled = False
+        # Jumlah batch yang harus dilewati pada epoch pertama setelah resume.
+        self._resume_batch_offset = 0
+        # Batas langkah global. Dipakai untuk protokol token-matched antar
+        # ukuran model (paper 6.2): dengan batch size dan urutan data yang
+        # sama, jumlah langkah yang sama berarti jumlah token yang sama.
+        self.max_steps = max_steps
+
         self.global_step = 0
         self.best_val_loss = float("inf")
         self.resume_epoch = 1  # dipakai sbg default start_epoch di fit()
@@ -318,6 +411,11 @@ class Trainer:
             self.writer.add_text("run_info/run_id", self.run_id, global_step=0)
 
         self._vis_batch = next(iter(self.val_loader))
+
+        # SLURM mengirim SIGTERM saat time-limit/scancel dan SIGUSR1 kalau job
+        # disubmit dengan --signal=B:USR1@<detik>. Keduanya memberi jendela
+        # beberapa detik untuk menyimpan checkpoint sebelum SIGKILL menyusul.
+        self._install_signal_handlers()
 
         g = torch.Generator().manual_seed(seed)
         d_model = self.model.d_model
@@ -359,6 +457,7 @@ class Trainer:
         )
         self.best_val_loss = best_metric
         self.global_step = global_step
+        self._restore_trainer_extra(path)
         print(
             f"[Trainer] Dimuat dari {path}: epoch={epoch}, global_step={global_step}, "
             f"best_val_loss={best_metric:.4f}"
@@ -368,13 +467,163 @@ class Trainer:
             f"Resumed from `{os.path.basename(path)}` at epoch={epoch}, global_step={global_step}",
             global_step=global_step,
         )
+        # Berapa batch dari epoch ini yang SUDAH dikonsumsi. Tanpa ini, resume
+        # memuat bobot yang benar tapi mengulang epoch dari batch pertama --
+        # bobotnya benar, tapi data yang sama diproses dua kali dan sisa epoch
+        # tidak pernah dilihat. Untuk run berhari-hari itu pemborosan besar.
+        n_per_epoch = max(1, len(self.train_loader))
+        self._resume_batch_offset = self.global_step % n_per_epoch
+        if self._resume_batch_offset:
+            print(f"[Trainer] Melanjutkan di tengah epoch: {self._resume_batch_offset}"
+                  f"/{n_per_epoch} batch sudah dikonsumsi, akan dilewati.")
+        # Epoch yang benar dihitung dari global_step, bukan dari nilai tersimpan,
+        # supaya konsisten walau checkpoint diambil di tengah epoch.
+        derived_epoch = self.global_step // n_per_epoch + 1
+        if self._resume_batch_offset:
+            return derived_epoch
         return epoch if redo_same_epoch else epoch + 1
+
+    def _save_ckpt(self, filename: str, epoch: int) -> str:
+        """Satu pintu penyimpanan supaya nama file & isi extra selalu konsisten."""
+        path = os.path.join(self.ckpt_dir, filename)
+        save_model(
+            path, self.model, self.optimizer, epoch, self.best_val_loss,
+            scheduler=self.lr_scheduler, global_step=self.global_step,
+            extra={"run_id": self.run_id, **self._trainer_extra()},
+            criterion=self.criterion,
+        )
+        return path
+
+    def _record(self, event: str, detail: str = ""):
+        """
+        Catat kejadian penting ke <ckpt_dir>/events.log. Sengaja file biasa, bukan
+        email: watchdog di slurm/watchdog.sh yang membaca berkas ini dan menyalakan
+        ulang job, jadi tidak perlu ada manusia di tengah jalur pemulihan.
+        """
+        line = f"{time.strftime('%Y-%m-%d %H:%M:%S')}\t{event}\tstep={self.global_step}\tepoch={self._current_epoch}\t{detail}\n"
+        try:
+            with open(os.path.join(self.ckpt_dir, "events.log"), "a") as f:
+                f.write(line)
+        except Exception:
+            pass
+        print(f"[Trainer] {event} {detail}", flush=True)
+
+    def _on_death(self, signame: str):
+        """
+        Handler sinyal. Tugasnya hanya menyelamatkan bobot lalu mencatat; watchdog
+        yang menyalakan ulang. Dibungkus try/except karena proses sedang sekarat --
+        kegagalan di sini tidak boleh menutupi penyebab aslinya.
+        """
+        if self._death_handled:
+            return
+        self._death_handled = True
+        try:
+            path = self._save_ckpt("latest_step.pt", self._current_epoch)
+            self._record("SIGNAL_SAVE", f"sinyal={signame} ckpt={path}")
+        except Exception as e:
+            self._record("SIGNAL_SAVE_FAILED", f"sinyal={signame} err={e!r}")
+        try:
+            self.writer.flush()
+        except Exception:
+            pass
+
+    def _install_signal_handlers(self):
+        import signal
+
+        def _handler(signum, frame):
+            self._on_death(signal.Signals(signum).name)
+            raise SystemExit(128 + signum)
+
+        for sig in (signal.SIGTERM, signal.SIGUSR1, signal.SIGINT):
+            try:
+                signal.signal(sig, _handler)
+            except (ValueError, OSError):
+                pass
+
+    def _check_grad_health(self, losses: dict):
+        """
+        Ledakan PERSISTEN dicatat, bukan dikirim lewat email. Spike tunggal sudah
+        dibuang otomatis oleh GradNormMonitor dan tidak perlu dicatat.
+        """
+        if self.grad_monitor.check_persistent_explosion(
+            self.grad_ema_threshold, self.grad_breach_required
+        ):
+            self._record(
+                "GRAD_EXPLOSION",
+                f"ema={self.grad_monitor.ema_value():.3f} ambang={self.grad_ema_threshold} "
+                f"raw={float(losses.get('grad_norm', 0.0)):.3f} "
+                f"berturut={self.grad_monitor.n_ema_breach}",
+            )
+
+    def _get_probe_texts(self):
+        """Batch teks tetap sepanjang run supaya kurvanya dapat diperbandingkan."""
+        if self._probe_texts is None:
+            b = self._vis_batch
+            self._probe_texts = [t[1] for t in b["texts"]][:64]   # indeks 1 = grafem kanonik
+        return self._probe_texts
+
+    @torch.no_grad()
+    def _log_research_metrics(self, out: dict):
+        """
+        Bukti SEMENTARA untuk tiap hipotesis, ditulis ke TensorBoard dengan tag
+        berawalan nomor hipotesis supaya panelnya langsung terbaca.
+        """
+        self.model.eval()
+        metrics = {}
+        try:
+            metrics.update(RM.rank_diagnostics(out))
+            metrics.update(RM.length_diagnostics(out, tau_l=self.criterion.tau_l))
+            metrics.update(RM.reconstruction_probe_readout(out))
+            metrics.update(RM.boundary_detection_accuracy(out, self.model.empty_norm_ratio))
+            metrics.update(RM.length_error_by_view_group(out, n_easy=self.n_aug_1))
+            texts = self._get_probe_texts()
+            if texts:
+                metrics.update(RM.word_order_discrimination(self.model, texts, self.device))
+                metrics.update(RM.homophone_discrimination(self.model, self.device))
+                metrics.update(RM.holdout_corruption_recall(self.model, texts, self.device))
+                metrics.update(RM.length_error_sensitivity(self.model, texts[:16], self.device))
+                if self.augmenter is not None:
+                    metrics.update(RM.progressive_corruption_recall(
+                        self.model, self.augmenter, texts, self.device))
+        except Exception as e:
+            self._record("RESEARCH_METRIC_FAILED", repr(e))
+        finally:
+            self.model.train()
+
+        for k, v in metrics.items():
+            self.writer.add_scalar(k, v, self.global_step)
+        return metrics
+
+    def _trainer_extra(self) -> dict:
+        """State non-parameter yang harus ikut selamat lintas crash/resume.
+        Tanpa ini, GradNormMonitor mulai dari nol setelah resume -- artinya
+        `warmup` step pertama TIDAK terlindungi dari spike, tepat di titik
+        paling rawan (bobot baru dimuat, momen Adam baru dipulihkan)."""
+        return {
+            "grad_monitor": self.grad_monitor.state_dict(),
+            "n_clipped": self._n_clipped,
+            "n_steps_done": self._n_steps_done,
+        }
+
+    def _restore_trainer_extra(self, path):
+        try:
+            ck = torch.load(path, map_location="cpu", weights_only=False)
+        except Exception:
+            return
+        ex = ck.get("extra", {}) or {}
+        if "grad_monitor" in ex:
+            self.grad_monitor.load_state_dict(ex["grad_monitor"])
+            print(f"[Trainer] GradNormMonitor dipulihkan: ema={self.grad_monitor.ema}, "
+                  f"seen={self.grad_monitor.n_seen}, skipped={self.grad_monitor.n_skipped}")
+        self._n_clipped = ex.get("n_clipped", 0)
+        self._n_steps_done = ex.get("n_steps_done", 0)
 
     def train(self, epoch: int, lr_scheduler=None):
         if lr_scheduler is not None:
             self.lr_scheduler = lr_scheduler  # utk kompatibilitas panggilan lama
 
         self.model.train()
+        self._current_epoch = epoch
         running = {}
         n_batches = len(self.train_loader)
         pbar = tqdm(self.train_loader, total=n_batches, desc=f"Epoch {epoch} [train]",
@@ -383,7 +632,23 @@ class Trainer:
         t_start = time.time()
         n_samples_seen = 0
 
+        # Lewati batch yang sudah dikonsumsi sebelum crash. Dikosongkan setelah
+        # epoch pertama supaya epoch berikutnya berjalan penuh.
+        skip = self._resume_batch_offset
+        self._resume_batch_offset = 0
+        if skip:
+            self._record("RESUME_SKIP", f"melewati {skip} batch pada epoch {epoch}")
+
         for step, batch in enumerate(pbar):
+            if step < skip:
+                continue
+            # Model perlu tahu global_step supaya jadwal p_TF (mixed-length
+            # canvas, paper 5.7 Tahap 7) bergerak sesuai progres training.
+            self.model.set_global_step(self.global_step)
+            # RankMe adalah instrumen penentu H5/H6/H8. Dihitung berkala karena
+            # SVD mahal kalau tiap step.
+            want_rank = bool(self.research_every_n_steps
+                             and self.global_step % self.research_every_n_steps == 0)
             if self.lambda_warmup_steps:
                 # Linear warmup: lambda_ mulai dari ~0 di global_step=0, naik
                 # linear sampai self._lambda_target persis di step ke-N.
@@ -393,12 +658,14 @@ class Trainer:
                 frac = min(1.0, self.global_step / self.lambda_warmup_steps)
                 self.criterion.lambda_ = frac * self._lambda_target
             try:
-                losses, _ = train_step(
+                losses, out = train_step(
                     self.model, self.optimizer, batch, self.criterion, self.n_core, self.n_pneg,
                     self.device, use_amp=self.use_amp,
                     amp_dtype=self.amp_dtype, grad_clip=self.grad_clip, canon_type=self.canon_type,
                     grad_debugger=self.grad_debugger, step=self.global_step,
                     log_every_n_steps=self.log_every_n_steps,
+                    grad_monitor=self.grad_monitor,
+                    compute_rank=want_rank,
                 )
             except RuntimeError as e:
                 is_oom = "out of memory" in str(e).lower()
@@ -428,6 +695,10 @@ class Trainer:
                 )
                 continue
 
+            # Cek ledakan persisten SETELAH step yang sah (bukan yang dibuang),
+            # supaya EMA yang dibaca mencerminkan gradien yang benar-benar dipakai.
+            self._check_grad_health(losses)
+
             if self.lr_scheduler is not None:
                 self.lr_scheduler.step()
 
@@ -442,7 +713,6 @@ class Trainer:
                 "Loss": f"{float(losses['total']):.4f}",
                 "L_syn": f"{float(losses['syntactic']):.3f}",
                 "L_sem": f"{float(losses['semantic']):.3f}",
-                "L_mag": f"{float(losses['magnitude']):.3f}",
                 "L_SIGReg": f"{float(losses['sigreg']):.3f}",
                 "L_len": f"{float(losses['canon_len']):.3f}",
                 "lambda": f"{self.criterion.lambda_:.3f}",
@@ -455,8 +725,31 @@ class Trainer:
                     self.writer.add_scalar(f"train_step/{k}", float(v), self.global_step)
                 self.writer.add_scalar("perf/samples_per_sec", samples_per_sec, self.global_step)
                 self.writer.add_scalar("train_step/lambda_current", self.criterion.lambda_, self.global_step)
+                # Kurva loss yang mulus bisa menyembunyikan clipping yang aktif TIAP step.
+                self._n_steps_done += 1
+                if self.grad_clip and float(losses.get("grad_norm", 0.0)) > self.grad_clip:
+                    self._n_clipped += 1
+                self.writer.add_scalar("train_step/clip_frac",
+                    self._n_clipped / max(1, self._n_steps_done), self.global_step)
+                self.writer.add_scalar("train_step/spike_skip_frac",
+                    self.grad_monitor.n_skipped / max(1, self.grad_monitor.n_seen), self.global_step)
+                self.writer.add_scalar("train_step/grad_norm_ema",
+                    self.grad_monitor.ema_value(), self.global_step)
+                # gamma LayerNorm terakhir: knob skala yang ditekan naik oleh SIGReg.
+                # Kalau kurva ini merangkak naik monoton dan titik baliknya berimpit
+                # dengan titik balik train_step/syntactic, mekanisme skala terkonfirmasi.
+                with torch.no_grad():
+                    self.writer.add_scalar("scale/gamma_enc_last",
+                        float(self.model.encoder.layers[-1].norm2.weight.norm()), self.global_step)
+                    self.writer.add_scalar("scale/gamma_dec_last",
+                        float(self.model.decoder.layers[-1].norm3.weight.norm()), self.global_step)
 
             self.global_step += 1
+
+            if self.max_steps is not None and self.global_step >= self.max_steps:
+                self._save_ckpt("latest_step.pt", epoch)
+                tqdm.write(f"[Trainer] max_steps={self.max_steps} tercapai; menghentikan epoch.")
+                break
 
             # --- Diagnostik visual periodik (BUKAN cuma di akhir epoch) -------
             # Epoch yang butuh berjam-jam/berhari-hari berarti "akhir epoch"
@@ -471,15 +764,12 @@ class Trainer:
             # dari checkpoint akhir-epoch. Nama file di-overwrite (bukan
             # per-step unik) supaya tidak membengkak; ini murni jaring pengaman
             # kalau training crash/disconnect di tengah epoch yang panjang.
+            if (self.research_every_n_steps
+                    and self.global_step % self.research_every_n_steps == 0):
+                self._log_research_metrics(out)
+
             if self.save_every_n_steps and self.global_step % self.save_every_n_steps == 0:
-                save_model(
-                    os.path.join(self.ckpt_dir, "latest_step.pt"),
-                    self.model, self.optimizer, epoch, self.best_val_loss,
-                    scheduler=self.lr_scheduler,
-                    global_step=self.global_step,
-                    extra={"run_id": self.run_id},
-                    criterion=self.criterion,
-                )
+                self._save_ckpt("latest_step.pt", epoch)
                 tqdm.write(f"[Trainer] Checkpoint tersimpan di step {self.global_step} (epoch {epoch}).")
 
         pbar.close()
@@ -570,7 +860,8 @@ class Trainer:
         z_c, masks_c = out["z_v_canon"], out["masks_v_canon"]
 
         pooled_prior = masked_mean(z_v, masks).float().cpu().numpy()
-        pooled_canon = masked_mean(z_c, masks_c).float().cpu().numpy()
+        # m_content, bukan m_canvas: wilayah kosong tidak boleh ikut pooling.
+        pooled_canon = masked_mean(z_c, out["masks_v_content"]).float().cpu().numpy()
 
         B, V, d = pooled_prior.shape
         B_show = min(B, self.n_vis_samples)
@@ -667,7 +958,7 @@ class Trainer:
 
         teacher_sim = self.criterion.cossim_fn(batch, n_core=self.n_core, negation_offset=self.n_core - self.n_pneg, n_negation=self.n_pneg)
 
-        pooled = masked_mean(z_c, m_c)
+        pooled = masked_mean(z_c, out["masks_v_content"])
         pooled_norm = F.normalize(pooled, dim=-1)
         flat = pooled_norm.reshape(B * V, -1)
         sim_all = (flat @ flat.t()).view(B, V, B, V).permute(0, 2, 1, 3)
@@ -711,6 +1002,9 @@ class Trainer:
         epoch_bar = tqdm(range(start_epoch, start_epoch + num_epochs), desc="Total progress",
                           colour="magenta", dynamic_ncols=True)
         for epoch in epoch_bar:
+            if self.max_steps is not None and self.global_step >= self.max_steps:
+                tqdm.write(f"[Trainer] max_steps={self.max_steps} tercapai; berhenti.")
+                break
             train_loss = self.train(epoch)
             val_loss = self.eval()
             self.log_to_tensorboard(epoch, train_loss, val_loss)
@@ -718,31 +1012,28 @@ class Trainer:
             improved = val_loss["total"] < self.best_val_loss
             if improved:
                 self.best_val_loss = val_loss["total"]
-                save_model(os.path.join(self.ckpt_dir, "best_model.pt"),
-                           self.model, self.optimizer, epoch, self.best_val_loss,
-                           scheduler=self.lr_scheduler, global_step=self.global_step,
-                           extra={"run_id": self.run_id}, criterion=self.criterion)
+                self._save_ckpt("best_model.pt", epoch)
 
             # Selalu simpan checkpoint di akhir tiap epoch (tidak lagi
             # bergantung pada save_every_n_epochs) supaya training bisa
             # di-resume dari epoch manapun kalau tiba-tiba crash/disconnect.
-            save_model(os.path.join(self.ckpt_dir, "latest_model.pt"),
-                       self.model, self.optimizer, epoch, self.best_val_loss,
-                       scheduler=self.lr_scheduler, global_step=self.global_step,
-                       extra={"run_id": self.run_id}, criterion=self.criterion)
+            self._save_ckpt("latest_model.pt", epoch)
+            # latest_step.pt juga disegarkan di akhir epoch supaya --resume
+            # selalu menemukan state paling baru apa pun titik matinya.
+            self._save_ckpt("latest_step.pt", epoch)
 
             marker = "\u2605 BEST" if improved else ""
             tqdm.write(
                 f"[Epoch {epoch:03d}] "
                 f"train_loss={train_loss['total']:.4f} "
                 f"(syn={train_loss['syntactic']:.3f} sem={train_loss['semantic']:.3f} "
-                f"mag={train_loss['magnitude']:.3f} "
                 f"sig={train_loss['sigreg']:.3f} len={train_loss['canon_len']:.3f}) | "
                 f"val_loss={val_loss['total']:.4f} {marker}"
             )
             epoch_bar.set_postfix({"best_val": f"{self.best_val_loss:.4f}"})
 
         epoch_bar.close()
+        self._record("FINISHED", f"best_val={self.best_val_loss:.6f}")
 
     def close(self):
         if self.grad_debugger is not None:
