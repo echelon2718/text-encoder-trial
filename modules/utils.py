@@ -64,4 +64,3 @@ def visualize_views_across_batch(out, batch):
         axs[j].set_title(f"Batch {batch}, View {j}")
     plt.tight_layout()
     plt.show()
-
