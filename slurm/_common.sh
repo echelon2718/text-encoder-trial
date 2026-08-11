@@ -42,8 +42,13 @@ export COMMON_ARGS="\
 --max-steps 60000 \
 --lr 1e-4 \
 --warmup-ratio 0.05 \
---min-lr-ratio 0.1 \
+--min-lr-ratio 5e-4 \
 --lambda_ 0.5 \
+--sigreg-space both \
+--sigreg-w-encoder 0.5 \
+--sigreg-w-decoder 0.5 \
+--debug-spike-ratio 50.0 \
+--debug-spike-zscore 50.0 \
 --zeta-syn 1.0 \
 --zeta-sem 1.0 \
 --zeta-sem-neg 1.0 \
@@ -54,7 +59,7 @@ export COMMON_ARGS="\
 --p-tf-min 0.5 \
 --tf-warmup-frac 0.3 \
 --tf-end-frac 0.6 \
---num-slices 256 \
+--num-slices 512 \
 --visualize-every-n-steps 2000 \
 --research-every-n-steps 2000 \
 --save-every-n-steps 500 \
