@@ -92,15 +92,6 @@ tlejepa_sanitize_slurm_env() {
 
 tlejepa_setup_env() {
     tlejepa_sanitize_slurm_env
-    # Kredensial dibaca DI DALAM job, bukan diandalkan lewat --export=ALL:
-    # watchdog men-submit dari lingkungan job lain yang belum tentu memuatnya.
-    # Simpan di ~/.tlejepa_secrets dengan permission 600.
-    if [ -f "$HOME/.tlejepa_secrets" ]; then
-        # shellcheck disable=SC1091
-        source "$HOME/.tlejepa_secrets"
-    fi
-    # ngrok sering dipasang ke ~/bin (tidak butuh sudo).
-    [ -d "$HOME/bin" ] && export PATH="$HOME/bin:$PATH"
     export MALLOC_ARENA_MAX=2
     export PYTHONUNBUFFERED=1
     export TOKENIZERS_PARALLELISM=false
