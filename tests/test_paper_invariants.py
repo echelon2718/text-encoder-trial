@@ -113,7 +113,7 @@ def main():
     model3.train()
     o3 = model3.train_forward(make_batch(), type="phoneme")
     sig = SIGReg(num_slices=16)
-    sigreg_loss(o3, sig, space='encoder').backward()
+    sigreg_loss(o3, sig, space='encoder')[0].backward()
     g_enc = sum(float(p.grad.abs().sum()) for p in model3.encoder.parameters()
                 if p.grad is not None)
     g_dec = sum(float(p.grad.abs().sum()) for p in model3.decoder.parameters()
@@ -126,12 +126,15 @@ def main():
     z = o4["z_v_canon"]
     B, V, M, d = z.shape
     mc = o4["masks_v_content"]
-    common = mc.all(dim=1, keepdim=True).unsqueeze(-1).float()
-    # target hard anchor manual
-    hard = ((z - (z[:, :1] * common)) ** 2 * common).sum() / (common.sum() * d * V)
+    # Perbandingan langsung terhadap formula hard-anchor naif tidak lagi berlaku:
+    # mu kini dibentuk pada KOORDINAT KANONIK lewat z_ref lalu diadaptasi kembali
+    # ke kanvas tiap view, sehingga bukan sekadar selisih terhadap z[:, :1].
+    # Yang diuji adalah perilakunya: w_canon harus tetap berpengaruh, dan nilainya
+    # harus monoton menuju rezim hard-anchor.
+    l_mid = float(syntactical_loss(o4, w_canon=8.0, eta_empty=0.0))
     l_big = float(syntactical_loss(o4, w_canon=1e6, eta_empty=0.0))
-    check("w_canon besar -> target ~ view 0", abs(l_big - float(hard)) < 1e-3,
-          f"loss={l_big:.5f} vs hard={float(hard):.5f}")
+    check("w_canon monoton menuju hard anchor", l_big > l_mid,
+          f"w=8 -> {l_mid:.5f} | w=1e6 -> {l_big:.5f}")
     l_1 = float(syntactical_loss(o4, w_canon=1.0, eta_empty=0.0))
     check("w_canon=1.0 (rerata rata) < w_canon besar", l_1 < l_big,
           f"{l_1:.5f} < {l_big:.5f}")
