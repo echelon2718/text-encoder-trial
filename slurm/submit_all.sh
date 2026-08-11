@@ -13,7 +13,7 @@ set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
 source slurm/_common.sh
 
-ALL=(R1 R2 R3 R4 R5 R6 R7 R8 R9 R10 R11a R11b)
+ALL=(R1 R2 R3 R4 R5 R6 R7 R8 R9 R10 R11a R11b R12)
 RUNS=("$@"); [ ${#RUNS[@]} -eq 0 ] && RUNS=("${ALL[@]}")
 export TLEJEPA_SEED="${TLEJEPA_SEED:-42}"
 mkdir -p logs
